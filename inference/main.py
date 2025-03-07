@@ -69,6 +69,16 @@ def parse_arguments():
     parser.add_argument('--inst_decoder_path', type=str, default='./xcodec_mini_infer/decoders/decoder_151000.pth', help='Path to Vocos decoder weights.')
     parser.add_argument('-r', '--rescale', action='store_true', help='Rescale output to avoid clipping.')
     
+    # Diffusion model enhancements (optional)
+    parser.add_argument('--use_diffusion', action='store_true', help='Enable diffusion model enhancements (any type).')
+    parser.add_argument('--diffusion_model_path', type=str, default='', help='Path to the pre-trained diffusion model weights.')
+    parser.add_argument('--use_hybrid_architecture', action='store_true', help='Use diffusion model in hybrid architecture with transformer for musical structure.')
+    parser.add_argument('--use_diffusion_postprocessing', action='store_true', help='Apply diffusion-based enhancement after Stage 2 inference.')
+    parser.add_argument('--use_conditional_diffusion', action='store_true', help='Use diffusion models conditioned on codec tokens for transitions.')
+    parser.add_argument('--diffusion_guidance_scale', type=float, default=3.0, help='Guidance scale for classifier-free guidance in diffusion (higher = more adherence to condition).')
+    parser.add_argument('--diffusion_steps', type=int, default=50, help='Number of diffusion steps to use for generation/refinement.')
+    parser.add_argument('--diffusion_sampling_method', type=str, default='ddpm', choices=['ddpm', 'ddim', 'plms'], help='Sampling method for diffusion model.')
+    
     # Other
     parser.add_argument("--use_stereo", action="store_true", help="Whether to use stereo processing for audio generation.")
     
@@ -123,22 +133,57 @@ def main():
     codectool = CodecManipulator("xcodec", 0, 1)
     codectool_stage2 = CodecManipulator("xcodec", n_quantizer=1)
     
+    # Initialize diffusion models if enabled
+    diffusion_hybrid_model = None
+    diffusion_postproc_model = None
+    diffusion_conditional_model = None
+    
+    if args.use_diffusion:
+        if not args.diffusion_model_path:
+            print("Warning: Diffusion enabled but no model path provided. Using fallbacks.")
+        
+        if args.use_hybrid_architecture:
+            from diffusion_models import HybridArchitectureDiffusion
+            from hybrid_diffusion import TransformerDiffusionHybrid
+            print("Initializing hybrid architecture diffusion model...")
+            diffusion_hybrid_model = HybridArchitectureDiffusion(
+                model_path=args.diffusion_model_path,
+                device=device
+            )
+            
+        if args.use_diffusion_postprocessing:
+            from diffusion_models import PostProcessingDiffusion
+            print("Initializing post-processing diffusion model...")
+            diffusion_postproc_model = PostProcessingDiffusion(
+                model_path=args.diffusion_model_path,
+                device=device
+            )
+            
+        if args.use_conditional_diffusion:
+            from diffusion_models import ConditionalDiffusion
+            from hybrid_diffusion import ConditionalDiffusionGenerator
+            print("Initializing conditional diffusion model...")
+            diffusion_conditional_model = ConditionalDiffusion(
+                model_path=args.diffusion_model_path,
+                device=device
+            )
+    
     # For stereo processing, initialize the stereo codec tool
     if args.use_stereo:
         stereo_codectool = StereoCodecManipulator("xcodec", 0, 1)
     
     # Load Stage 1 model
     print("Loading Stage 1 model...")
-    model = AutoModelForCausalLM.from_pretrained(
+    stage1_model = AutoModelForCausalLM.from_pretrained(
         args.stage1_model, 
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
-    model.to(device)
-    model.eval()
+    stage1_model.to(device)
+    stage1_model.eval()
     
     if torch.__version__ >= "2.0.0":
-        model = torch.compile(model)
+        stage1_model = torch.compile(stage1_model)
     
     # Prepare prompt texts
     with open(args.genre_txt, 'r', encoding='utf-8') as f:
@@ -172,44 +217,72 @@ def main():
     
     if args.use_stereo and args.use_dual_tracks_prompt:
         # Use stereo generation
-        stage1_output_set = stage1_inference_stereo(model, prompt_text, codectool, mmtokenizer, device, args)
+        stage1_output_set = stage1_inference_stereo(
+            model=stage1_model, 
+            prompt_texts=prompt_text, 
+            codectool=codectool, 
+            mmtokenizer=mmtokenizer, 
+            device=device, 
+            args=args
+        )
     else:
         # Use regular mono generation
-        stage1_output_set = stage1_inference(model, prompt_text, codectool, mmtokenizer, device, args)
+        stage1_output_set = stage1_inference(
+            model=stage1_model, 
+            prompt_text=prompt_text, 
+            codectool=codectool, 
+            mmtokenizer=mmtokenizer, 
+            device=device, 
+            args=args
+        )
     
-    # Offload model to save memory
+    # Unload Stage 1 model to save memory if not disabled
     if not args.disable_offload_model:
-        model.cpu()
-        del model
+        print("Offloading Stage 1 model to save memory...")
+        del stage1_model
         torch.cuda.empty_cache()
     
-    # Stage 2 inference
-    print("Stage 2 inference...")
-    model_stage2 = AutoModelForCausalLM.from_pretrained(
-        args.stage2_model, 
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+    # Load Stage 2 model
+    print("Loading Stage 2 model...")
+    stage2_model = AutoModelForCausalLM.from_pretrained(
+        args.stage2_model,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto" if torch.cuda.is_available() else None,
+        trust_remote_code=True,
     )
-    model_stage2.to(device)
-    model_stage2.eval()
     
-    if torch.__version__ >= "2.0.0":
-        model_stage2 = torch.compile(model_stage2)
-    
-    # Run Stage 2 inference
+    # Stage 2 inference
     if args.use_stereo:
-        stage2_result = stage2_inference_stereo(
-            model_stage2, stage1_output_set, stage2_output_dir, 
-            codectool_stage2, mmtokenizer, batch_size=args.stage2_batch_size
+        # Stage 2 inference with stereo
+        stage2_output_set = stage2_inference_stereo(
+            model=stage2_model,
+            stage1_output_set=stage1_output_set,
+            stage2_output_dir=stage2_output_dir,
+            codectool=codectool_stage2,
+            mmtokenizer=mmtokenizer,
+            batch_size=args.stage2_batch_size,
+            apply_enhancements=True,
+            diffusion_postproc_model=diffusion_postproc_model,
+            diffusion_steps=args.diffusion_steps,
+            diffusion_sampling_method=args.diffusion_sampling_method
         )
     else:
-        stage2_result = stage2_inference(
-            model_stage2, stage1_output_set, stage2_output_dir, 
-            codectool_stage2, batch_size=args.stage2_batch_size,
-            apply_enhancements=args.enhance_audio
+        # Stage 2 inference
+        stage2_output_set = stage2_inference(
+            model=stage2_model,
+            stage1_output_set=stage1_output_set,
+            stage2_output_dir=stage2_output_dir,
+            codectool=codectool_stage2,
+            mmtokenizer=mmtokenizer,
+            device=device,
+            batch_size=args.stage2_batch_size,
+            apply_enhancements=True,
+            diffusion_postproc_model=diffusion_postproc_model,
+            diffusion_steps=args.diffusion_steps,
+            diffusion_sampling_method=args.diffusion_sampling_method
         )
     
-    print(stage2_result)
+    print(stage2_output_set)
     print('Stage 2 DONE.\n')
     
     # Reconstruct tracks
@@ -218,7 +291,7 @@ def main():
     os.makedirs(recons_mix_dir, exist_ok=True)
     
     tracks = []
-    for npy in stage2_result:
+    for npy in stage2_output_set:
         codec_result = np.load(npy)
         decodec_rlt = []
         
@@ -270,7 +343,7 @@ def main():
         print("Applying audio enhancements to the final output...")
         
         # Apply both audio enhancements and frequency blending
-        for output_path in stage2_result:
+        for output_path in stage2_output_set:
             audio_path = output_path.replace('.npy', '.wav')
             if os.path.exists(audio_path):
                 # First apply enhancements

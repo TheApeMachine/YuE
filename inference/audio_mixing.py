@@ -11,8 +11,22 @@ from YuE.inference.dsp.phase import (
     apply_look_ahead_limiter, 
     apply_soft_clipper
 )
-from dsp.utils import normalize, deep_merge_dicts
-from dsp.imaging import enhance_stereo_width
+from YuE.inference.dsp.utils import normalize, deep_merge_dicts
+from YuE.inference.dsp.imaging import enhance_stereo_width
+from YuE.inference.dsp.filtering import (
+    enhance_vocals,
+    carve_space_for_vocals,
+    spectral_balance
+)
+from YuE.inference.dsp.saturation import (
+    apply_saturation,
+    multi_band_saturation,
+    exciter
+)
+from YuE.inference.dsp.reverb import (
+    apply_reverb,
+    add_space
+)
 
 def mix_tracks_basic(vocal, instrumental, vocal_gain=1.0, instrumental_gain=0.8):
     return ((vocal*vocal_gain)+(instrumental*instrumental_gain))/(vocal_gain+instrumental_gain)
@@ -23,12 +37,19 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
      1. Normalizes
      2. Phase aligns (optionally multi-band)
      3. (Optional) compress vocals & instrumentals individually
-     4. Gains
-     5. (Optional) sidechain
-     6. Summation
-     7. (Optional) multi-band compression
-     8. (Optional) stereo width
-     9. (Optional) look-ahead limiting or soft clip
+     4. (Optional) enhance vocals with vocal-specific EQ
+     5. (Optional) carve space for vocals in instrumental
+     6. (Optional) apply saturation to instrumental for warmth
+     7. Gains
+     8. (Optional) sidechain
+     9. Summation
+     10. (Optional) multi-band compression
+     11. (Optional) exciter for high-end clarity
+     12. (Optional) multi-band saturation
+     13. (Optional) spectral balancing for professional frequency curve
+     14. (Optional) reverb/ambience
+     15. (Optional) stereo width
+     16. (Optional) look-ahead limiting or soft clip
      ...
     """
     # default
@@ -57,7 +78,48 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
         'sidechain': {'enabled':False, 'threshold':-24.0, 'ratio':2.0},
         'stereo_width': {'enabled':True, 'width':1.2},
         'lookahead_limiter': {'enabled':True, 'threshold': -1.0, 'attack':0.001, 'release':0.05},
-        'soft_clip': {'enabled':False, 'threshold':0.8, 'softness':0.1}
+        'soft_clip': {'enabled':False, 'threshold':0.8, 'softness':0.1},
+        # New features
+        'vocal_enhancement': {
+            'enabled': True, 
+            'level': 0.7
+        },
+        'vocal_space_carving': {
+            'enabled': True,
+            'level': 0.6
+        },
+        'instrumental_saturation': {
+            'enabled': True,
+            'amount': 0.3,
+            'type': 'tube'
+        },
+        'exciter': {
+            'enabled': True,
+            'amount': 0.4,
+            'frequency': 3000
+        },
+        'multiband_saturation': {
+            'enabled': False,
+            'bands': [(0,250),(250,2000),(2000,8000),(8000,22050)],
+            'amounts': [0.6, 0.4, 0.2, 0.1],
+            'types': ['tube', 'tanh', 'soft_clip', 'tanh']
+        },
+        'spectral_balance': {
+            'enabled': True,
+            'strength': 0.7
+        },
+        'reverb': {
+            'enabled': False,
+            'mix': 0.2,
+            'room_size': 0.7,
+            'damping': 0.5,
+            'pre_delay_ms': 20
+        },
+        'ambience': {
+            'enabled': False,
+            'space_type': 'medium_room',
+            'mix': 0.15
+        }
     }
     if mix_params is None:
         params = DEFAULT_PARAMS
@@ -107,26 +169,54 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
         if ic['enabled']:
             instrumental = apply_compression(instrumental, ic['threshold'], ic['ratio'], sr=sr)
         
-        # 4) Gains
+        # 4) vocal enhancement
+        ve = params['vocal_enhancement']
+        if ve['enabled']:
+            try:
+                vocal = enhance_vocals(vocal, level=ve['level'], sr=sr)
+            except Exception as e:
+                print(f"Warning: vocal enhancement failed: {e}")
+        
+        # 5) carve space for vocals in instrumental
+        vsc = params['vocal_space_carving']
+        if vsc['enabled']:
+            try:
+                instrumental = carve_space_for_vocals(instrumental, vocal, level=vsc['level'], sr=sr)
+            except Exception as e:
+                print(f"Warning: vocal space carving failed: {e}")
+        
+        # 6) instrumental saturation for warmth
+        is_params = params['instrumental_saturation']
+        if is_params['enabled']:
+            try:
+                instrumental = apply_saturation(
+                    instrumental, 
+                    amount=is_params['amount'], 
+                    saturation_type=is_params['type']
+                )
+            except Exception as e:
+                print(f"Warning: instrumental saturation failed: {e}")
+        
+        # 7) Gains
         vg = params['vocal_gain']
         ig = params['instrumental_gain']
         vocal = vocal*vg
         instrumental = instrumental*ig
         
-        # 5) sidechain
+        # 8) sidechain
         sc = params['sidechain']
         if sc['enabled']:
             # sidechain compress instrumental with vocal
             instrumental = apply_compression(instrumental, sc['threshold'], sc['ratio'], sr=sr,
                                              sidechain_signal=vocal)
         
-        # 6) sum
+        # 9) sum
         mixed = vocal + instrumental
         max_val = mixed.abs().max()
         if max_val>1.0:
             mixed = mixed*(1.0/max_val)  # quick fix
         
-        # 7) multi-band comp on the mix
+        # 10) multi-band comp on the mix
         mbc = params['multiband_compression']
         if mbc['enabled']:
             if len(mbc['bands'])==len(mbc['thresholds'])==len(mbc['ratios']):
@@ -139,13 +229,73 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
             else:
                 print("Warning: multi-band compression param mismatch.")
         
-        # 8) stereo width
+        # 11) exciter for high-end clarity
+        ex = params['exciter']
+        if ex['enabled']:
+            try:
+                mixed = exciter(mixed, amount=ex['amount'], freq=ex['frequency'], sr=sr)
+            except Exception as e:
+                print(f"Warning: exciter failed: {e}")
+        
+        # 12) multi-band saturation
+        mbs = params['multiband_saturation']
+        if mbs['enabled']:
+            try:
+                if len(mbs['bands'])==len(mbs['amounts']):
+                    mixed = multi_band_saturation(
+                        mixed, 
+                        bands=mbs['bands'],
+                        amounts=mbs['amounts'],
+                        types=mbs.get('types', None),
+                        sr=sr
+                    )
+                else:
+                    print("Warning: multi-band saturation param mismatch.")
+            except Exception as e:
+                print(f"Warning: multi-band saturation failed: {e}")
+        
+        # 13) spectral balancing
+        sb = params['spectral_balance']
+        if sb['enabled']:
+            try:
+                mixed = spectral_balance(mixed, strength=sb['strength'], sr=sr)
+            except Exception as e:
+                print(f"Warning: spectral balancing failed: {e}")
+        
+        # 14) reverb/ambience
+        rv = params['reverb']
+        if rv['enabled']:
+            try:
+                mixed = apply_reverb(
+                    mixed, 
+                    mix=rv['mix'],
+                    room_size=rv['room_size'],
+                    damping=rv['damping'],
+                    pre_delay_ms=rv['pre_delay_ms'],
+                    sr=sr
+                )
+            except Exception as e:
+                print(f"Warning: reverb failed: {e}")
+        
+        amb = params['ambience']
+        if amb['enabled'] and not rv['enabled']:  # only apply if reverb isn't already applied
+            try:
+                mixed = add_space(
+                    mixed,
+                    space_type=amb['space_type'],
+                    mix=amb['mix'],
+                    sr=sr
+                )
+            except Exception as e:
+                print(f"Warning: ambience failed: {e}")
+        
+        # 15) stereo width
         sw = params['stereo_width']
         if sw['enabled'] and mixed.dim()>1 and mixed.shape[0]>=2:
             w = max(0.0, min(2.0, sw['width']))
             mixed = enhance_stereo_width(mixed, w)
         
-        # 9) final limiting or soft clip
+        # 16) final limiting or soft clip
         la = params['lookahead_limiter']
         scp = params['soft_clip']
         
@@ -179,7 +329,7 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
 def process_files_with_enhancements(vocal_path, instrumental_path, output_path, mix_params=None):
     """
     Loads vocal, loads instrumental, ensures same SR, calls enhanced_audio_mix,
-    then saves the result. Keeps your advanced approach for ensuring the user’s 
+    then saves the result. Keeps your advanced approach for ensuring the user's 
     chosen sample rate is consistent, etc.
     """
     vocal, sr_v = torchaudio.load(vocal_path)

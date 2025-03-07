@@ -7,6 +7,8 @@ from collections import Counter
 from einops import rearrange
 from transformers import LogitsProcessorList
 import torchaudio
+from audio_utils import save_audio
+from vocoder import build_codec_model
 
 from codec_utils import BlockTokenRangeProcessor
 from token_fixer import fix_tokens
@@ -174,32 +176,41 @@ def post_process_generated_audio(audio, sr=44100, apply_enhancements=True):
     
     return audio
 
-def process_and_save_audio(audio, output_path, sr=44100, apply_enhancements=True):
+def process_and_save_audio(audio, output_path, sr=44100, apply_enhancements=True, diffusion_postproc_model=None, diffusion_steps=50, diffusion_sampling_method='ddpm'):
     """
-    Process and save audio with enhancements
+    Process and save generated audio
     
     Args:
-        audio: Audio tensor
-        output_path: Output file path
+        audio: Audio data to process
+        output_path: Path to save processed audio
         sr: Sample rate
-        apply_enhancements: Whether to apply enhancements
+        apply_enhancements: Whether to apply enhancement algorithms
+        diffusion_postproc_model: Optional diffusion model for post-processing
+        diffusion_steps: Number of steps for diffusion process
+        diffusion_sampling_method: Sampling method for diffusion
         
     Returns:
-        Path to saved file
+        Path to saved audio file
     """
-    # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
-    # Apply enhancements
+    # Apply standard enhancements if needed
     if apply_enhancements:
-        audio = post_process_generated_audio(audio, sr)
+        audio = post_process_generated_audio(audio, sr=sr, apply_enhancements=True)
+
+    # Apply diffusion-based post-processing if model is provided
+    if diffusion_postproc_model is not None:
+        print("Applying diffusion-based audio enhancement...")
+        audio = diffusion_postproc_model.enhance_audio(
+            audio, 
+            steps=diffusion_steps,
+            sampling_method=diffusion_sampling_method
+        )
     
-    # Save the processed audio
-    torchaudio.save(output_path, audio, sr)
+    # Save audio
+    save_audio(audio, output_path, sr=sr)
     
     return output_path
 
-def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, batch_size=4, apply_enhancements=True):
+def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, mmtokenizer, device, batch_size=4, apply_enhancements=True, diffusion_postproc_model=None, diffusion_steps=50, diffusion_sampling_method='ddpm'):
     """
     Run Stage 2 inference
     
@@ -208,8 +219,13 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, bat
         stage1_output_set: Paths to Stage 1 output files
         stage2_output_dir: Output directory for Stage 2 results
         codectool: Codec tool for token manipulation
+        mmtokenizer: Tokenizer for audio processing
+        device: Processing device
         batch_size: Processing batch size
         apply_enhancements: Whether to apply audio enhancements
+        diffusion_postproc_model: Optional diffusion model for post-processing
+        diffusion_steps: Number of steps for diffusion process
+        diffusion_sampling_method: Sampling method for diffusion
         
     Returns:
         Paths to generated audio files
@@ -231,31 +247,33 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, bat
         num_batch = output_duration // 6
         
         if num_batch <= batch_size:
-            # If num_batch is less than or equal to batch_size, we can infer the entire prompt at once
-            output = stage2_generate(model, prompt[:, :output_duration*50], batch_size=num_batch)
+            # Generate audio from codec tokens
+            output = stage2_generate(model, prompt[:, :output_duration*50], codectool, mmtokenizer, device, batch_size=num_batch)
         else:
             # If num_batch is greater than batch_size, process in chunks of batch_size
-            segments = []
-            num_segments = (num_batch // batch_size) + (1 if num_batch % batch_size != 0 else 0)
-
-            for seg in range(num_segments):
-                start_idx = seg * batch_size * 300
-                # Ensure the end_idx does not exceed the available length
-                end_idx = min((seg + 1) * batch_size * 300, output_duration*50)  
-                current_batch_size = batch_size if seg != num_segments-1 or num_batch % batch_size == 0 else num_batch % batch_size
-                segment = stage2_generate(
+            outputs = []
+            for i in range(0, num_batch, batch_size):
+                start_idx = i * 300
+                end_idx = min((i + batch_size) * 300, output_duration*50)
+                current_batch_size = (end_idx - start_idx + 299) // 300
+                
+                # Generate this chunk
+                chunk = stage2_generate(
                     model,
                     prompt[:, start_idx:end_idx],
+                    codectool,
+                    mmtokenizer,
+                    device,
                     batch_size=current_batch_size
                 )
-                segments.append(segment)
-
-            # Concatenate all the segments
-            output = np.concatenate(segments, axis=0)
+                outputs.append(chunk)
+            
+            # Concatenate all chunks
+            output = np.concatenate(outputs, axis=0)
         
-        # Process the ending part of the prompt
+        # Process the ending part of the prompt if necessary
         if output_duration*50 != prompt.shape[-1]:
-            ending = stage2_generate(model, prompt[:, output_duration*50:], batch_size=1)
+            ending = stage2_generate(model, prompt[:, output_duration*50:], codectool, mmtokenizer, device, batch_size=1)
             output = np.concatenate([output, ending], axis=0)
         
         output = codectool.ids2npy(output)
@@ -264,9 +282,17 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, bat
         original_path = output_filename.replace('.npy', '_original.npy') if output_filename.endswith('.npy') else f"{output_filename}_original.npy"
         fixed_output = fix_tokens(output, min_valid=0, max_valid=1023, save_original=True, original_path=original_path)
         
-        # Save the fixed output
-        np.save(output_filename, fixed_output)
-        stage2_result.append(output_filename)
+        # Process and save the output
+        processed_path = process_and_save_audio(
+            fixed_output, 
+            output_filename, 
+            apply_enhancements=apply_enhancements,
+            diffusion_postproc_model=diffusion_postproc_model,
+            diffusion_steps=diffusion_steps,
+            diffusion_sampling_method=diffusion_sampling_method
+        )
+        
+        stage2_result.append(processed_path)
     
     if apply_enhancements:
         stage2_result_enhanced = []
@@ -328,21 +354,24 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, bat
     else:
         return stage2_result
 
-def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codectool, mmtokenizer, batch_size=4, apply_enhancements=True):
+def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codectool, mmtokenizer, batch_size=4, apply_enhancements=True, diffusion_postproc_model=None, diffusion_steps=50, diffusion_sampling_method='ddpm'):
     """
-    Run Stage 2 inference for stereo
+    Run Stage 2 inference for stereo audio
     
     Args:
         model: Generation model
         stage1_output_set: Paths to Stage 1 output files
         stage2_output_dir: Output directory for Stage 2 results
         codectool: Codec tool for token manipulation
-        mmtokenizer: Tokenizer
+        mmtokenizer: Tokenizer for audio processing
         batch_size: Processing batch size
         apply_enhancements: Whether to apply audio enhancements
+        diffusion_postproc_model: Optional diffusion model for post-processing
+        diffusion_steps: Number of steps for diffusion process
+        diffusion_sampling_method: Sampling method for diffusion
         
     Returns:
-        Paths to generated audio files
+        Paths to generated stereo audio files
     """
     stage2_result = []
     for i in tqdm(range(len(stage1_output_set))):
