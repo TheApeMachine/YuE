@@ -4,26 +4,29 @@ import torchaudio
 from torchaudio.transforms import Resample
 import numpy as np
 
-from YuE.inference.dsp.compression import apply_compression
-from YuE.inference.dsp.phase import (
-    align_phases, 
-    multiband_phase_alignment, 
+from dsp.compression import (
+    apply_compression,
     apply_look_ahead_limiter, 
     apply_soft_clipper
 )
-from YuE.inference.dsp.utils import normalize, deep_merge_dicts
-from YuE.inference.dsp.imaging import enhance_stereo_width
-from YuE.inference.dsp.filtering import (
+from dsp.phase import (
+    align_phases, 
+    multiband_phase_alignment
+)
+from dsp.utils import normalize, deep_merge_dicts
+from dsp.imaging import enhance_stereo_width
+from dsp.filtering import (
     enhance_vocals,
     carve_space_for_vocals,
-    spectral_balance
+    spectral_balance,
+    apply_bandpass
 )
-from YuE.inference.dsp.saturation import (
+from dsp.saturation import (
     apply_saturation,
     multi_band_saturation,
     exciter
 )
-from YuE.inference.dsp.reverb import (
+from dsp.reverb import (
     apply_reverb,
     add_space
 )
@@ -325,6 +328,51 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
         # fallback
         safe_mix = 0.5*(vocal + instrumental)
         return safe_mix
+
+def multi_band_compression(audio, bands=[(0, 250), (250, 2000), (2000, 8000), (8000, 22050)], 
+                          thresholds=[-24, -18, -18, -16], ratios=[2.5, 2.0, 1.8, 1.5], sr=44100):
+    """
+    Apply multi-band compression
+    
+    Args:
+        audio: Audio tensor
+        bands: List of (low_freq, high_freq) tuples defining bands
+        thresholds: Threshold for each band in dB
+        ratios: Compression ratio for each band
+        sr: Sample rate
+        
+    Returns:
+        Multi-band compressed audio
+    """
+    # Split into bands
+    band_signals = []
+    for low_freq, high_freq in bands:
+        band_signal = apply_bandpass(audio, low_freq, high_freq, sr)
+        band_signals.append(band_signal)
+    
+    # Compress each band
+    compressed_bands = []
+    for i, band_signal in enumerate(band_signals):
+        compressed = apply_compression(band_signal, thresholds[i], ratios[i], sr=sr)
+        compressed_bands.append(compressed)
+    
+    # Sum the compressed bands
+    result = sum(compressed_bands)
+    
+    return result
+
+def apply_gain_staging(audio, gain_db=0.0):
+    """
+    Apply gain staging to audio
+    
+    Args:
+        audio: Audio tensor
+        gain_db: Gain in dB to apply
+        
+    Returns:
+        Gain-staged audio
+    """
+    return audio * (10 ** (gain_db / 20))
 
 def process_files_with_enhancements(vocal_path, instrumental_path, output_path, mix_params=None):
     """

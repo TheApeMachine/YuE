@@ -1,8 +1,8 @@
 import torch
 import math
 import numpy as np
-from YuE.inference.dsp.utils import apply_per_channel
-from YuE.inference.dsp.filtering import apply_bandpass
+from dsp.utils import apply_per_channel
+from dsp.filtering import apply_bandpass
 
 def apply_saturation(audio, amount=0.5, saturation_type='tanh'):
     """

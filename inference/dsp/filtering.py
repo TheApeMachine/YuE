@@ -2,7 +2,7 @@ import math
 import torch
 from scipy import signal
 
-from YuE.inference.dsp.utils import apply_per_channel, to_mono
+from dsp.utils import apply_per_channel, to_mono
 
 def apply_highpass(audio, freq, sr):
     """
@@ -87,6 +87,101 @@ def _highpass_biquad(channel, freq, sr):
         out[i] = y
         
     return out
+
+def apply_lowpass(audio, freq, sr):
+    """
+    Advanced Butterworth lowpass filter with precise digital biquad implementation.
+    
+    This is significantly more accurate than a simple 1-pole implementation,
+    providing steeper rolloff and better phase response.
+    
+    Args:
+        audio: Audio tensor
+        freq: Cutoff frequency in Hz
+        sr: Sample rate in Hz
+        
+    Returns:
+        Filtered audio with same shape as input
+    """
+    try:
+        # Try using SciPy's zero-phase filtfilt for best quality
+        return apply_per_channel(audio, _lowpass_scipy, freq, sr)
+    except Exception:
+        # Fall back to direct biquad implementation
+        return apply_per_channel(audio, _lowpass_biquad, freq, sr)
+
+def _lowpass_scipy(channel, freq, sr):
+    """SciPy-based zero-phase lowpass filter implementation."""
+    nyquist = sr / 2
+    # Use a 4th order Butterworth filter for better quality
+    sos = signal.butter(4, freq / nyquist, btype='lowpass', output='sos')
+    
+    # Convert to numpy for processing
+    device = channel.device
+    dtype = channel.dtype
+    c_np = channel.cpu().numpy()
+    
+    # Use filtfilt for zero-phase filtering (no delay)
+    filtered = signal.sosfiltfilt(sos, c_np)
+    
+    return torch.tensor(filtered, dtype=dtype, device=device)
+
+def _lowpass_biquad(channel, freq, sr):
+    """
+    Advanced biquad lowpass filter implementation.
+    
+    This implementation uses the transposed direct form II structure
+    which has better numerical properties than a simple 1-pole filter.
+    """
+    device = channel.device
+    dtype = channel.dtype
+    
+    # Normalize frequency to Nyquist
+    f = freq / (sr/2)
+    
+    # Prevent issues at Nyquist
+    f = min(0.99, f)
+    
+    # Compute coefficients for 2nd order lowpass
+    w0 = math.pi * f
+    cos_w0 = math.cos(w0)
+    sin_w0 = math.sin(w0)
+    alpha = sin_w0 / (2.0 * 0.7071) # Q = 0.7071 for Butterworth
+    
+    b0 = (1.0 - cos_w0) / 2.0
+    b1 = 1.0 - cos_w0
+    b2 = (1.0 - cos_w0) / 2.0
+    a0 = 1.0 + alpha
+    a1 = -2.0 * cos_w0
+    a2 = 1.0 - alpha
+    
+    # Normalize
+    b0 /= a0
+    b1 /= a0
+    b2 /= a0
+    a1 /= a0
+    a2 /= a0
+    
+    # Apply filter
+    x1 = 0
+    x2 = 0
+    y1 = 0
+    y2 = 0
+    
+    output = torch.zeros_like(channel)
+    
+    for i in range(len(channel)):
+        x0 = channel[i].item()
+        y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        
+        output[i] = y0
+        
+        x2 = x1
+        x1 = x0
+        y2 = y1
+        y1 = y0
+    
+    return output
 
 def apply_high_shelf(audio, freq, gain_db, sr):
     """

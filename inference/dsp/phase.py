@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from YuE.inference.dsp.filtering import apply_bandpass
+from dsp.filtering import apply_bandpass
 from dsp.utils import to_mono
 
 def align_phases(reference, target, fft_size=2048, hop_size=512,

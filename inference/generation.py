@@ -76,16 +76,80 @@ def stage2_generate(model, prompt, codectool, mmtokenizer, device, batch_size=16
         cb0 = codec_ids[:, frames_idx:frames_idx+1]
         prompt_ids = torch.cat([prompt_ids, cb0], dim=1)
         input_ids = prompt_ids
+        
+        # Create attention mask (all 1's since we don't have padding)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long).to(device)
 
         with torch.no_grad():
-            stage2_output = model.generate(
-                input_ids=input_ids, 
-                min_new_tokens=7,
-                max_new_tokens=7,
-                eos_token_id=mmtokenizer.eoa,
-                pad_token_id=mmtokenizer.eoa,
-                logits_processor=block_list,
-            )
+            try:
+                stage2_output = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    min_new_tokens=7,
+                    max_new_tokens=7,
+                    eos_token_id=mmtokenizer.eoa,
+                    pad_token_id=mmtokenizer.eoa,
+                    logits_processor=block_list,
+                )
+            except RuntimeError as e:
+                # Handle CUDA errors
+                print(f"Error during stage2 generation: {e}")
+                print("Attempting to recover...")
+                
+                # Try to free up CUDA memory
+                torch.cuda.empty_cache()
+                
+                # If the error is a cuBLAS error, try with different settings
+                if "cublasLt ran into an error" in str(e) or "CUBLAS_STATUS_NOT_SUPPORTED" in str(e):
+                    try:
+                        print("CUDA/cuBLAS error detected. Attempting recovery...")
+                        
+                        # Check if it's a bfloat16 compatibility issue
+                        if "CUDA_R_16BF" in str(e):
+                            print("bfloat16 compatibility issue detected. Switching to CPU with float32 precision...")
+                            # Move to CPU and use float32 (most compatible)
+                            cpu_model = model.cpu().to(torch.float32)
+                            cpu_input_ids = input_ids.cpu()
+                            cpu_attention_mask = attention_mask.cpu()
+                        else:
+                            print("Switching to CPU for this operation...")
+                            # Just move to CPU with original precision
+                            cpu_model = model.to('cpu')
+                            cpu_input_ids = input_ids.to('cpu')
+                            cpu_attention_mask = attention_mask.to('cpu')
+                        
+                        # Reduce max_new_tokens to save memory
+                        reduced_max_tokens = min(args.max_new_tokens, 500)
+                        print(f"Reducing max_new_tokens from {args.max_new_tokens} to {reduced_max_tokens}")
+                        
+                        # Generate with reduced parameters
+                        outputs = cpu_model.generate(
+                            input_ids=cpu_input_ids,
+                            attention_mask=cpu_attention_mask,
+                            max_new_tokens=reduced_max_tokens,
+                            do_sample=True,
+                            temperature=getattr(args, 'temperature', 0.7),
+                            top_p=getattr(args, 'top_p', 0.95),
+                            repetition_penalty=args.repetition_penalty,
+                            eos_token_id=mmtokenizer.eoa,
+                            pad_token_id=mmtokenizer.eoa,
+                        )
+                        
+                        # Move back to GPU if needed for further processing
+                        outputs = outputs.to(device)
+                        
+                        # Don't move model back to GPU to avoid memory issues
+                        print("Generation completed on CPU. Keeping model on CPU to conserve GPU memory.")
+                        
+                    except Exception as recovery_error:
+                        print(f"Recovery attempt failed: {recovery_error}")
+                        error_msg = "Failed to generate tokens due to CUDA errors. Please try: \n"
+                        error_msg += "1. Using --low_memory_mode with a lower --max_new_tokens value (200-500)\n"
+                        error_msg += "2. Adding --no_bfloat16 to avoid bfloat16 precision issues\n"
+                        error_msg += "3. Running on CPU only with --device cpu\n"
+                        raise RuntimeError(error_msg) from e
+                else:
+                    raise  # Re-raise if it's not a CUDA error
         
         assert stage2_output.shape[1] - prompt_ids.shape[1] == 7, \
             f"output new tokens={stage2_output.shape[1]-prompt_ids.shape[1]}"
@@ -585,8 +649,14 @@ def stage1_inference(model, prompt_text, codectool, mmtokenizer, device, args):
         prompt_text += f"<|audio_prompt|>"
     
     # Encode the prompt text
-    input_ids = mmtokenizer.encode(prompt_text, bos=True, eos=False)
+    input_ids = mmtokenizer.tokenize(prompt_text)
+    # Add BOS token (as the original code was using bos=True)
+    input_ids = [mmtokenizer.bos] + input_ids
+    
     input_ids = torch.tensor(input_ids).unsqueeze(0).to(device)
+    
+    # Create attention mask (all 1's since we don't have padding)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.long).to(device)
     
     # Generate segments
     for seg_idx in range(args.run_n_segments):
@@ -601,16 +671,78 @@ def stage1_inference(model, prompt_text, codectool, mmtokenizer, device, args):
         
         # Generate with temperature and top_p sampling
         with torch.no_grad():
-            outputs = model.generate(
-                input_ids=input_ids,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=True,
-                temperature=getattr(args, 'temperature', 0.7),  # Default to 0.7 if not specified
-                top_p=getattr(args, 'top_p', 0.95),  # Default to 0.95 if not specified
-                repetition_penalty=args.repetition_penalty,
-                eos_token_id=mmtokenizer.eoa,
-                pad_token_id=mmtokenizer.eoa,
-            )
+            try:
+                outputs = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=True,
+                    temperature=getattr(args, 'temperature', 0.7),  # Default to 0.7 if not specified
+                    top_p=getattr(args, 'top_p', 0.95),  # Default to 0.95 if not specified
+                    repetition_penalty=args.repetition_penalty,
+                    eos_token_id=mmtokenizer.eoa,
+                    pad_token_id=mmtokenizer.eoa,
+                )
+            except RuntimeError as e:
+                # Handle CUDA OOM or other runtime errors
+                print(f"Error during generation: {e}")
+                print("Attempting to recover by reducing batch size and memory usage...")
+                
+                # Try to free up CUDA memory
+                torch.cuda.empty_cache()
+                
+                # If the error is a cuBLAS error, try with different settings
+                if "cublasLt ran into an error" in str(e) or "CUBLAS_STATUS_NOT_SUPPORTED" in str(e):
+                    try:
+                        print("CUDA/cuBLAS error detected. Attempting recovery...")
+                        
+                        # Check if it's a bfloat16 compatibility issue
+                        if "CUDA_R_16BF" in str(e):
+                            print("bfloat16 compatibility issue detected. Switching to CPU with float32 precision...")
+                            # Move to CPU and use float32 (most compatible)
+                            cpu_model = model.cpu().to(torch.float32)
+                            cpu_input_ids = input_ids.cpu()
+                            cpu_attention_mask = attention_mask.cpu()
+                        else:
+                            print("Switching to CPU for this operation...")
+                            # Just move to CPU with original precision
+                            cpu_model = model.to('cpu')
+                            cpu_input_ids = input_ids.to('cpu')
+                            cpu_attention_mask = attention_mask.to('cpu')
+                        
+                        # Reduce max_new_tokens to save memory
+                        reduced_max_tokens = min(args.max_new_tokens, 500)
+                        print(f"Reducing max_new_tokens from {args.max_new_tokens} to {reduced_max_tokens}")
+                        
+                        # Generate with reduced parameters
+                        outputs = cpu_model.generate(
+                            input_ids=cpu_input_ids,
+                            attention_mask=cpu_attention_mask,
+                            max_new_tokens=reduced_max_tokens,
+                            do_sample=True,
+                            temperature=getattr(args, 'temperature', 0.7),
+                            top_p=getattr(args, 'top_p', 0.95),
+                            repetition_penalty=args.repetition_penalty,
+                            eos_token_id=mmtokenizer.eoa,
+                            pad_token_id=mmtokenizer.eoa,
+                        )
+                        
+                        # Move back to GPU if needed for further processing
+                        outputs = outputs.to(device)
+                        
+                        # Don't move model back to GPU to avoid memory issues
+                        print("Generation completed on CPU. Keeping model on CPU to conserve GPU memory.")
+                        
+                    except Exception as recovery_error:
+                        print(f"Recovery attempt failed: {recovery_error}")
+                        error_msg = "Failed to generate tokens due to CUDA errors. Please try: \n"
+                        error_msg += "1. Using --low_memory_mode with a lower --max_new_tokens value (200-500)\n"
+                        error_msg += "2. Adding --no_bfloat16 to avoid bfloat16 precision issues\n"
+                        error_msg += "3. Running on CPU only with --device cpu\n"
+                        raise RuntimeError(error_msg) from e
+                else:
+                    error_detected = True
+                    raise
         
         generated_ids = outputs[0].cpu().numpy()
         

@@ -1,8 +1,8 @@
 import torch
 import math
 import numpy as np
-from YuE.inference.dsp.utils import apply_per_channel
-from YuE.inference.dsp.filtering import apply_highpass, apply_lowpass
+from dsp.utils import apply_per_channel
+from dsp.filtering import apply_highpass, apply_lowpass
 
 def apply_reverb(audio, mix=0.3, room_size=0.8, damping=0.5, sr=44100, pre_delay_ms=20):
     """

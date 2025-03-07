@@ -8,7 +8,8 @@ import numpy as np
 import torch
 import torchaudio
 
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoConfig, GenerationConfig, GPTNeoXTokenizerFast
+from transformers.trainer_pt_utils import is_sagemaker_mp_enabled
 from omegaconf import OmegaConf
 from codecmanipulator import CodecManipulator, StereoCodecManipulator
 from mmtokenizer import _MMSentencePieceTokenizer
@@ -28,6 +29,8 @@ from generation import (
     stage2_inference, stage2_inference_stereo, stage1_inference_stereo,
     stage1_inference, post_process_generated_audio, process_and_save_audio
 )
+
+from transformers import BitsAndBytesConfig
 
 def parse_arguments():
     """Parse command line arguments"""
@@ -60,6 +63,12 @@ def parse_arguments():
     parser.add_argument("--disable_offload_model", action="store_true", help="If set, the model will not be offloaded from the GPU to CPU after Stage 1 inference.")
     parser.add_argument("--cuda_idx", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42, help="An integer value to reproduce generation.")
+    parser.add_argument("--low_memory_mode", action="store_true", help="Enable low memory mode to reduce memory usage at the cost of speed. Useful for GPUs with limited VRAM.")
+    parser.add_argument("--no_bfloat16", action="store_true", help="Disable the use of bfloat16 precision, which can cause compatibility issues on some GPUs. Use float16 instead.")
+    parser.add_argument("--device", type=str, choices=["cpu", "cuda"], default="cuda", help="Device to run inference on. Use 'cpu' for maximum compatibility.")
+    parser.add_argument("--force_cpu", action="store_true", help="Force CPU-only operation for maximum stability, especially on WSL or systems with GPU compatibility issues.")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for sampling during generation. Higher values (>1.0) make output more random, lower values (<1.0) make it more deterministic.")
+    parser.add_argument("--top_p", type=float, default=0.95, help="Top-p (nucleus) sampling parameter. Controls diversity by only considering tokens with cumulative probability < top_p.")
 
     # Config for xcodec and upsampler
     parser.add_argument('--basic_model_config', default='./xcodec_mini_infer/final_ckpt/config.yaml', help='YAML files for xcodec configurations.')
@@ -107,6 +116,45 @@ def main():
     # Parse arguments
     args = parse_arguments()
     
+    # Set the seed for reproducibility
+    seed_everything(args.seed)
+    
+    # Initialize device based on command line parameter
+    if args.force_cpu:
+        device = torch.device("cpu")
+        args.device = "cpu"  # Override device setting
+        print("Forcing CPU-only operation for maximum stability")
+    elif args.device == "cuda" and torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.cuda_idx}")
+        print(f"Using device: {device}")
+    else:
+        device = torch.device("cpu")
+        print("Using device: cpu")
+    
+    # Configure memory settings based on mode
+    if args.low_memory_mode:
+        print("Running in low memory mode - performance may be slower but more stable")
+        # Increase memory garbage collection
+        torch.cuda.empty_cache()
+        
+        # In low memory mode, explicitly set low quantization config
+        if torch.cuda.is_available() and args.device == "cuda":
+            print("Setting up 8-bit quantization with reduced precision in low memory mode")
+            
+            # Reduce max_new_tokens in low memory mode
+            if args.max_new_tokens > 1000:
+                print(f"Reducing max_new_tokens from {args.max_new_tokens} to 1000 in low memory mode")
+                args.max_new_tokens = 1000
+    
+    # Choose precision based on parameters and compatibility
+    if args.no_bfloat16:
+        dtype = torch.float16
+        compute_dtype = torch.float16
+        print("Using float16 precision instead of bfloat16 for better compatibility")
+    else:
+        dtype = torch.float16 if args.device == "cuda" else torch.float32
+        compute_dtype = torch.float16 if args.device == "cuda" else torch.float32
+    
     # Set up output directories
     os.makedirs(args.output_dir, exist_ok=True)
     stage1_output_dir = os.path.join(args.output_dir, "stage1")
@@ -115,11 +163,7 @@ def main():
     os.makedirs(stage2_output_dir, exist_ok=True)
     
     # Set random seed
-    seed_everything(args.seed)
     random_id = str(uuid.uuid4())[:8]
-    
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Load tokenizer
     mmtokenizer = _MMSentencePieceTokenizer(args.tokenizer_model)
@@ -172,15 +216,63 @@ def main():
     if args.use_stereo:
         stereo_codectool = StereoCodecManipulator("xcodec", 0, 1)
     
-    # Load Stage 1 model
+    # Initialize and load Stage 1 model
     print("Loading Stage 1 model...")
-    stage1_model = AutoModelForCausalLM.from_pretrained(
-        args.stage1_model, 
-        torch_dtype=torch.bfloat16,
-        attn_implementation="eager",
-        load_in_8bit=True,
-        device_map="auto",
-    )
+    
+    # Low memory config
+    if args.low_memory_mode and args.device == "cuda" and torch.cuda.is_available():
+        config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=compute_dtype
+        )
+        stage1_model = AutoModelForCausalLM.from_pretrained(
+            args.stage1_model,
+            device_map="auto" if args.device == "cuda" else None,
+            torch_dtype=dtype,
+            quantization_config=config,
+            attn_implementation="eager",  # Use eager implementation instead of flash attention
+            low_cpu_mem_usage=True,
+        )
+    elif args.device == "cuda" and torch.cuda.is_available():
+        # Standard loading on GPU
+        stage1_model = AutoModelForCausalLM.from_pretrained(
+            args.stage1_model,
+            device_map="auto",
+            torch_dtype=dtype,
+            load_in_8bit=True,
+            attn_implementation="eager",  # Use eager implementation instead of flash attention
+            low_cpu_mem_usage=True,
+        )
+    else:
+        # CPU loading - use minimal memory
+        print("Loading model on CPU - this may take longer but will be more stable")
+        try:
+            # First attempt with standard loading
+            stage1_model = AutoModelForCausalLM.from_pretrained(
+                args.stage1_model,
+                device_map=None,
+                torch_dtype=torch.float32,  # Use float32 on CPU for compatibility
+                attn_implementation="eager",  # Use eager implementation instead of flash attention
+                low_cpu_mem_usage=True,
+            )
+            # Move model to CPU explicitly
+            stage1_model = stage1_model.to("cpu")
+        except Exception as cpu_load_error:
+            print(f"Standard CPU model loading failed: {cpu_load_error}")
+            print("Trying fallback CPU loading method...")
+            
+            # Fallback method with conservative settings
+            stage1_model = AutoModelForCausalLM.from_pretrained(
+                args.stage1_model,
+                device_map={"": "cpu"},
+                torch_dtype=torch.float32,
+                offload_folder="offload_folder",
+                offload_state_dict=True,
+                low_cpu_mem_usage=True,
+            )
+    
     stage1_model.eval()
     
     # Prepare prompt texts

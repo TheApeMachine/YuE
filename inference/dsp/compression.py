@@ -1,6 +1,6 @@
 import math
 import torch
-from YuE.inference.dsp.filtering import apply_bandpass
+from dsp.filtering import apply_bandpass
 from dsp.utils import apply_per_channel
 
 def apply_look_ahead_limiter(audio, threshold_db=-1.0, release_time=0.05,

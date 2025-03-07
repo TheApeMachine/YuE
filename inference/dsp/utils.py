@@ -1,4 +1,14 @@
 import torch
+
+def to_mono(audio):
+    """
+    Convert multi-channel to mono by averaging. If already mono, no change.
+    """
+    if audio.dim()>1 and audio.shape[0]>1:
+        return audio.mean(dim=0)
+    return audio.squeeze(0) if audio.dim()>1 else audio
+
+# Import after to_mono is defined to avoid circular import
 from dsp.metering import measure_lufs
 
 def normalize(vocal, instrumental, target_lufs=-16.0, sr=44100):
@@ -12,14 +22,6 @@ def normalize(vocal, instrumental, target_lufs=-16.0, sr=44100):
     i_gain = 10**((target_lufs - inst_lufs)/20)
     
     return vocal*v_gain, instrumental*i_gain
-
-def to_mono(audio):
-    """
-    Convert multi-channel to mono by averaging. If already mono, no change.
-    """
-    if audio.dim()>1 and audio.shape[0]>1:
-        return audio.mean(dim=0)
-    return audio.squeeze(0) if audio.dim()>1 else audio
 
 def apply_per_channel(audio, func, *args, **kwargs):
     """
