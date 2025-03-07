@@ -11,6 +11,206 @@ from audio_mixing import (
     enhance_stereo_width
 )
 
+def multi_resolution_stft(audio, fft_sizes=(256, 1024, 4096), hop_ratios=(0.25, 0.25, 0.25), sr=44100):
+    """
+    Perform multi-resolution STFT analysis using different window sizes for
+    different frequency bands, optimizing time-frequency resolution tradeoffs.
+    
+    Args:
+        audio: Audio tensor (mono)
+        fft_sizes: Tuple of FFT sizes for different bands (small to large)
+        hop_ratios: Ratio of hop size to window size for each FFT size
+        sr: Sample rate
+        
+    Returns:
+        Dictionary with STFT results for each resolution
+    """
+    results = {}
+    
+    # Ensure audio is single-channel for analysis
+    if audio.dim() > 1 and audio.shape[0] > 1:
+        analysis_audio = audio.mean(dim=0)
+    else:
+        analysis_audio = audio.squeeze(0) if audio.dim() > 1 else audio
+    
+    # Compute STFTs at different resolutions
+    for i, fft_size in enumerate(fft_sizes):
+        hop_size = int(fft_size * hop_ratios[i])
+        window = torch.hann_window(fft_size)
+        
+        if torch.cuda.is_available():
+            window = window.to(analysis_audio.device)
+        
+        # Compute STFT
+        stft = torch.stft(
+            analysis_audio, 
+            n_fft=fft_size, 
+            hop_length=hop_size,
+            win_length=fft_size,
+            window=window,
+            return_complex=True
+        )
+        
+        # Calculate frequency resolution
+        freq_resolution = sr / fft_size
+        time_resolution = hop_size / sr
+        
+        # Store results
+        results[fft_size] = {
+            'stft': stft,
+            'magnitude': torch.abs(stft),
+            'phase': torch.angle(stft),
+            'freq_resolution': freq_resolution,
+            'time_resolution': time_resolution,
+            'hop_size': hop_size,
+            'window': window
+        }
+    
+    return results
+
+def multi_resolution_istft(mr_stft_data, audio_length=None):
+    """
+    Reconstruct audio from multi-resolution STFT data
+    
+    Args:
+        mr_stft_data: Multi-resolution STFT data from multi_resolution_stft
+        audio_length: Target audio length (if None, determined automatically)
+        
+    Returns:
+        Reconstructed audio
+    """
+    reconstructions = []
+    
+    # Reconstruct from each resolution
+    for fft_size, data in mr_stft_data.items():
+        # Get parameters
+        stft = data['stft']
+        hop_size = data['hop_size']
+        window = data['window']
+        
+        # Inverse STFT
+        audio_recon = torch.istft(
+            stft,
+            n_fft=fft_size,
+            hop_length=hop_size,
+            win_length=fft_size,
+            window=window,
+            length=audio_length
+        )
+        
+        reconstructions.append(audio_recon)
+    
+    # Average the reconstructions
+    # This simple approach works surprisingly well for many audio signals
+    return torch.stack(reconstructions).mean(dim=0)
+
+def multi_resolution_band_extraction(audio, band_ranges, sr=44100, crossfade_ratio=0.25):
+    """
+    Extract frequency bands using multi-resolution analysis, with appropriate
+    window sizes for each frequency range to optimize time-frequency resolution.
+    
+    Args:
+        audio: Audio tensor
+        band_ranges: List of (low_freq, high_freq, fft_size) tuples
+        sr: Sample rate
+        crossfade_ratio: Amount of crossfade between adjacent bands (0-0.5)
+        
+    Returns:
+        List of extracted bands
+    """
+    # Handle multi-channel audio
+    if audio.dim() > 1:
+        channels = []
+        for ch in range(audio.shape[0]):
+            ch_bands = multi_resolution_band_extraction(audio[ch], band_ranges, sr, crossfade_ratio)
+            channels.append(ch_bands)
+        
+        # Reorganize by band rather than by channel
+        result = []
+        for band_idx in range(len(band_ranges)):
+            band_channels = []
+            for ch_idx in range(len(channels)):
+                band_channels.append(channels[ch_idx][band_idx])
+            result.append(torch.stack(band_channels))
+        
+        return result
+    
+    # Process mono audio
+    extracted_bands = []
+    audio_length = audio.shape[-1]
+    
+    # Sort bands by frequency
+    sorted_bands = sorted(band_ranges, key=lambda x: x[0])
+    
+    for i, (low_freq, high_freq, fft_size) in enumerate(sorted_bands):
+        # Calculate hop size
+        hop_size = fft_size // 4
+        
+        # Prepare window
+        window = torch.hann_window(fft_size)
+        if torch.cuda.is_available():
+            window = window.to(audio.device)
+        
+        # Calculate STFT
+        stft = torch.stft(
+            audio,
+            n_fft=fft_size,
+            hop_length=hop_size,
+            win_length=fft_size,
+            window=window,
+            return_complex=True
+        )
+        
+        # Calculate frequencies for each bin
+        freqs = torch.linspace(0, sr/2, stft.shape[0])
+        
+        # Create band mask with crossfade/overlap
+        mask = torch.zeros(stft.shape[0])
+        
+        # Regular mask (box filter)
+        in_band = (freqs >= low_freq) & (freqs <= high_freq)
+        mask[in_band] = 1.0
+        
+        # Add crossfade transitions if this isn't the first or last band
+        if i > 0:
+            # Crossfade with previous band
+            prev_low, prev_high, _ = sorted_bands[i-1]
+            overlap_width = (low_freq - prev_high) * crossfade_ratio
+            if overlap_width > 0:
+                # Create crossfade region
+                overlap_mask = (freqs >= prev_high) & (freqs < low_freq)
+                # Linear crossfade
+                crossfade_values = (freqs[overlap_mask] - prev_high) / (low_freq - prev_high)
+                mask[overlap_mask] = crossfade_values
+        
+        if i < len(sorted_bands) - 1:
+            # Crossfade with next band
+            next_low, next_high, _ = sorted_bands[i+1]
+            overlap_width = (next_low - high_freq) * crossfade_ratio
+            if overlap_width > 0:
+                # Create crossfade region
+                overlap_mask = (freqs > high_freq) & (freqs <= next_low)
+                # Linear crossfade
+                crossfade_values = 1.0 - (freqs[overlap_mask] - high_freq) / (next_low - high_freq)
+                mask[overlap_mask] = crossfade_values
+        
+        # Apply mask to STFT
+        masked_stft = stft * mask.view(-1, 1).to(stft.dtype)
+        
+        # Inverse STFT
+        band = torch.istft(
+            masked_stft,
+            n_fft=fft_size,
+            hop_length=hop_size,
+            win_length=fft_size,
+            window=window,
+            length=audio_length
+        )
+        
+        extracted_bands.append(band)
+    
+    return extracted_bands
+
 def replace_low_freq_with_energy_matched_single(a_waveform, b_waveform, cutoff_freq=5500.0, sr_a=16000, sr_b=44100):
     """
     Process a single audio channel by replacing low frequencies
@@ -54,12 +254,27 @@ def replace_low_freq_with_energy_matched_single(a_waveform, b_waveform, cutoff_f
     a_energy = torch.mean(torch.abs(a_fft[cutoff_bin:]) ** 2)
     b_energy = torch.mean(torch.abs(b_fft[:cutoff_bin]) ** 2)
     scale_factor = torch.sqrt(a_energy / (b_energy + 1e-8))
+    
+    # Apply scaling for smooth energy matching
     combined_fft[:cutoff_bin] *= scale_factor
     
-    # Convert back to time domain
-    processed = torch.fft.irfft(combined_fft, n=min_length)
+    # Apply a gradual crossfade between the two at the cutoff region
+    # Define a transition width (10% of the cutoff bin)
+    transition_width = max(int(cutoff_bin * 0.1), 1)
+    transition_start = max(0, cutoff_bin - transition_width)
+    transition_end = min(len(combined_fft), cutoff_bin + transition_width)
     
-    return processed
+    # Create crossfade weights
+    weights = torch.linspace(0.0, 1.0, transition_end - transition_start)
+    
+    # Apply weighted crossfade
+    crossfade_region = torch.linspace(transition_start, transition_end, transition_end - transition_start).long()
+    combined_fft[crossfade_region] = (1.0 - weights) * (b_fft[crossfade_region] * scale_factor) + weights * a_fft[crossfade_region]
+    
+    # Convert back to time domain
+    combined_waveform = torch.fft.irfft(combined_fft, n=min_length)
+    
+    return combined_waveform
 
 def replace_low_freq_with_energy_matched(a_file, b_file, c_file, cutoff_freq=5500.0):
     """
