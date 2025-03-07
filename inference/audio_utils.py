@@ -10,7 +10,7 @@ from audio_mixing import process_files_with_enhancements, enhanced_audio_mix
 
 def load_audio_mono(filepath, sampling_rate=16000):
     """
-    Load audio file and convert to mono
+    Load audio file with mono channel
     
     Args:
         filepath: Path to audio file
@@ -20,30 +20,10 @@ def load_audio_mono(filepath, sampling_rate=16000):
         Tensor of shape [1, samples]
     """
     audio, sr = torchaudio.load(filepath)
-    # Convert to mono
-    audio = torch.mean(audio, dim=0, keepdim=True)
-    # Resample if needed
-    if sr != sampling_rate:
-        resampler = Resample(orig_freq=sr, new_freq=sampling_rate)
-        audio = resampler(audio)
-    return audio
-
-def load_audio_stereo(filepath, sampling_rate=16000):
-    """
-    Load audio file with stereo channel preservation
     
-    Args:
-        filepath: Path to audio file
-        sampling_rate: Target sampling rate
-    
-    Returns:
-        Tensor of shape [channels, samples]
-    """
-    audio, sr = torchaudio.load(filepath)
-    
-    # Keep stereo if it exists, otherwise duplicate mono to create stereo
-    if audio.shape[0] == 1:
-        audio = audio.repeat(2, 1)  # Duplicate mono to stereo
+    # Convert to mono if stereo
+    if audio.shape[0] > 1:
+        audio = torch.mean(audio, dim=0, keepdim=True)
         
     # Resample if needed
     if sr != sampling_rate:
@@ -54,25 +34,7 @@ def load_audio_stereo(filepath, sampling_rate=16000):
 
 def save_audio(wav: torch.Tensor, path, sample_rate: int, rescale: bool = False):
     """
-    Save audio to file
-    
-    Args:
-        wav: Audio tensor
-        path: Output file path
-        sample_rate: Sampling rate
-        rescale: Whether to rescale audio to avoid clipping
-    """
-    folder_path = os.path.dirname(path)
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-    limit = 0.99
-    max_val = wav.abs().max()
-    wav = wav * min(limit / max_val, 1) if rescale else wav.clamp(-limit, limit)
-    torchaudio.save(str(path), wav, sample_rate=sample_rate, encoding='PCM_S', bits_per_sample=16)
-
-def save_audio_stereo(wav, path, sample_rate, rescale=False):
-    """
-    Save audio with stereo preservation
+    Save audio with mono or stereo preservation
     
     Args:
         wav: Audio tensor of shape [channels, samples]
@@ -88,13 +50,7 @@ def save_audio_stereo(wav, path, sample_rate, rescale=False):
     max_val = wav.abs().max()
     wav = wav * min(limit / max_val, 1) if rescale else wav.clamp(-limit, limit)
     
-    # Ensure stereo format (2 channels)
-    if wav.dim() == 1:
-        wav = wav.unsqueeze(0).repeat(2, 1)  # Convert mono to stereo
-    elif wav.shape[0] == 1:
-        wav = wav.repeat(2, 1)  # Convert mono to stereo
-        
-    torchaudio.save(str(path), wav, sample_rate=sample_rate, encoding='PCM_S', bits_per_sample=16)
+    torchaudio.save(str(path), wav, sample_rate)
 
 def process_stereo_mix(vocal_path, instrumental_path, output_path):
     """
@@ -224,7 +180,7 @@ def apply_dither(audio, bits=16, dither_type='tpdf', noise_shaping=True):
     
     return output
 
-def save_audio_with_dithering(audio, file_path, sample_rate=44100, bits=16, dither_type='tpdf', format="WAV"):
+def save_audio_with_dithering(audio, file_path, sample_rate=44100, bits=16, dither_type='tpdf', noise_shaping=True, format="WAV"):
     """
     Save audio with proper dithering to the specified bit depth.
     
@@ -234,6 +190,7 @@ def save_audio_with_dithering(audio, file_path, sample_rate=44100, bits=16, dith
         sample_rate: Sample rate in Hz
         bits: Target bit depth (16 for CD quality, 24 for high-res)
         dither_type: Type of dithering to apply ('none', 'rpdf', 'tpdf', 'gaussian')
+        noise_shaping: Whether to apply noise shaping for better quality at low bit depths
         format: Output file format (default WAV)
         
     Returns:
@@ -244,7 +201,7 @@ def save_audio_with_dithering(audio, file_path, sample_rate=44100, bits=16, dith
         audio = torch.tensor(audio)
     
     # Apply dithering
-    dithered_audio = apply_dither(audio, bits=bits, dither_type=dither_type)
+    dithered_audio = apply_dither(audio, bits=bits, dither_type=dither_type, noise_shaping=noise_shaping)
     
     # Save audio file
     torchaudio.save(
@@ -284,7 +241,7 @@ def load_audio_stereo(file_path, target_sr=None):
     
     return audio, sr
 
-def save_audio_stereo(audio, file_path, sample_rate=44100, bits=16, dither_type='tpdf'):
+def save_audio_stereo(audio, file_path, sample_rate=44100, bits=16, dither_type='tpdf', noise_shaping=True, rescale=False):
     """
     Save stereo audio with proper dithering
     
@@ -294,10 +251,26 @@ def save_audio_stereo(audio, file_path, sample_rate=44100, bits=16, dither_type=
         sample_rate: Sample rate in Hz
         bits: Bit depth
         dither_type: Dithering type
+        noise_shaping: Whether to apply noise shaping for better quality
+        rescale: Whether to rescale audio to avoid clipping
         
     Returns:
         None
     """
+    # Create output directory if it doesn't exist
+    folder_path = os.path.dirname(file_path)
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+    
+    # Rescale audio if requested to avoid clipping
+    if rescale:
+        limit = 0.99
+        max_val = audio.abs().max()
+        audio = audio * min(limit / max_val, 1) if max_val > 0 else audio
+    else:
+        # Just clamp to safe range
+        audio = audio.clamp(-0.99, 0.99)
+    
     # Ensure audio is stereo
     if audio.dim() == 1:
         audio = audio.unsqueeze(0).repeat(2, 1)
@@ -305,4 +278,4 @@ def save_audio_stereo(audio, file_path, sample_rate=44100, bits=16, dither_type=
         audio = audio.repeat(2, 1)
     
     # Use dithering-enhanced save function
-    save_audio_with_dithering(audio, file_path, sample_rate, bits, dither_type) 
+    save_audio_with_dithering(audio, file_path, sample_rate, bits, dither_type, noise_shaping) 
