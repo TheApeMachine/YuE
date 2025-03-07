@@ -1,497 +1,380 @@
-"""
-Token fixing utilities for audio codec outputs.
-
-This module provides functions to analyze and fix invalid tokens in codec outputs.
-"""
-
 import numpy as np
 import copy
 from collections import Counter
-from sklearn.neighbors import NearestNeighbors
+from multiprocessing import Pool, cpu_count
+from tqdm import tqdm  # Optional: for progress bars
+from sklearn.neighbors import NearestNeighbors  # for KNN if available
 
 
-def analyze_token_issues(tokens):
+def get_masks_and_indices(tokens, min_valid, max_valid):
     """
-    Analyze token array for issues and patterns of invalid tokens
+    Return valid/invalid masks and valid indices for the given token array.
     
     Args:
-        tokens: Token array
+        tokens: 1D or 2D numpy array of tokens.
+        min_valid: Minimum valid token value.
+        max_valid: Maximum valid token value.
         
     Returns:
-        Dictionary with analysis results
+        valid_mask: Boolean mask where tokens are valid.
+        invalid_mask: Boolean mask where tokens are invalid.
+        valid_indices: Indices where tokens are valid (only meaningful if tokens are 1D).
+    """
+    invalid_mask = (tokens < min_valid) | (tokens > max_valid)
+    valid_mask = ~invalid_mask
+    valid_indices = np.where(valid_mask)[0] if tokens.ndim == 1 else None
+    return valid_mask, invalid_mask, valid_indices
+
+
+def get_fallback_token(valid_tokens, min_valid, max_valid):
+    """
+    Get a fallback token from the most common valid token or a midpoint if none found.
+    """
+    if len(valid_tokens) > 0:
+        token_counts = Counter(valid_tokens)
+        return token_counts.most_common(1)[0][0]
+    else:
+        return (min_valid + max_valid) // 2
+
+
+def analyze_token_issues(tokens, min_valid=0, max_valid=1023):
+    """
+    Analyze token array for issues: how many are invalid, consecutive invalid runs, etc.
+    Returns a dictionary of stats.
     """
     total_tokens = tokens.size
-    invalid_count = np.sum((tokens < 0) | (tokens > 1023))
+    if total_tokens == 0:
+        return {
+            "total_tokens": 0,
+            "invalid_count": 0,
+            "invalid_percent": 0.0,
+            "invalid_rows": set(),
+            "consecutive_invalids": 0,
+        }
+
+    # We treat each row individually if it's 2D.
+    # If it's 1D, treat it like a single row.
+    if tokens.ndim == 1:
+        tokens = tokens.reshape(1, -1)
+
+    invalid_mask = (tokens < min_valid) | (tokens > max_valid)
+    invalid_count = np.sum(invalid_mask)
     invalid_percent = (invalid_count / total_tokens) * 100 if total_tokens > 0 else 0
+
+    max_consecutive = 0
+    invalid_rows = set()
     
-    # Check for patterns in invalid tokens
-    result = {
+    for i, row in enumerate(tokens):
+        row_invalid = invalid_mask[i]
+        if np.any(row_invalid):
+            invalid_rows.add(i)
+
+        # Count consecutive invalid in this row
+        consecutive = 0
+        for val in row_invalid:
+            if val:
+                consecutive += 1
+                max_consecutive = max(max_consecutive, consecutive)
+            else:
+                consecutive = 0
+
+    return {
         "total_tokens": total_tokens,
         "invalid_count": invalid_count,
         "invalid_percent": invalid_percent,
-        "invalid_rows": set(),
-        "consecutive_invalids": 0
+        "invalid_rows": invalid_rows,
+        "consecutive_invalids": max_consecutive,
     }
+
+
+def _fix_invalid_region(
+    row, region, valid_indices, fallback_token, min_valid, max_valid
+):
+    """
+    Fix a consecutive region of invalid tokens by either position-based or boundary-based approach.
+    If region length <= 3, we do a local position-based fix.
+    If region length > 3, we do a boundary-based fix.
     
-    # Find rows with high invalid percentages and consecutive invalid tokens
-    max_consecutive = 0
-    current_consecutive = 0
-    
-    for i, row in enumerate(tokens):
-        row_invalid = np.sum((row < 0) | (row > 1023))
-        if row_invalid > 0:
-            result["invalid_rows"].add(i)
-            row_invalid_percent = (row_invalid / len(row)) * 100
-            if row_invalid_percent > 10:  # More than 10% invalid in a row
-                # This row might need special handling
-                pass
-        
-        # Count consecutive invalid tokens
-        for element in row:
-            if element < 0 or element > 1023:
-                current_consecutive += 1
+    Returns a dict of {invalid_index: fixed_token_value}.
+    """
+    fixes = {}
+    region_len = len(region)
+    if region_len == 0:
+        return fixes
+
+    # Decide strategy
+    strategy = "position" if region_len <= 3 else "boundary"
+
+    # If using boundary approach, find outer valid tokens on each side
+    region_start, region_end = region[0], region[-1]
+    left_side = valid_indices[valid_indices < region_start]
+    right_side = valid_indices[valid_indices > region_end]
+
+    left_token = row[left_side[-1]] if len(left_side) > 0 else None
+    right_token = row[right_side[0]] if len(right_side) > 0 else None
+
+    if strategy == "boundary":
+        # We gradually interpolate between left_token and right_token by position,
+        # but since these tokens aren't numeric in a strict sense, we can just
+        # do a simple "use left if < halfway, else use right".
+        for idx_offset, invalid_pos in enumerate(region):
+            if left_token is not None and right_token is not None:
+                progress = idx_offset / (region_len - 1) if region_len > 1 else 0.5
+                fixes[invalid_pos] = left_token if progress < 0.5 else right_token
+            elif left_token is not None:
+                fixes[invalid_pos] = left_token
+            elif right_token is not None:
+                fixes[invalid_pos] = right_token
             else:
-                max_consecutive = max(max_consecutive, current_consecutive)
-                current_consecutive = 0
-    
-    # Final check for consecutive count
-    max_consecutive = max(max_consecutive, current_consecutive)
-    result["consecutive_invalids"] = max_consecutive
-    
-    return result
+                fixes[invalid_pos] = fallback_token
+
+    else:
+        # Position-based fix for short regions.
+        for invalid_pos in region:
+            # Attempt to find nearest valid token by position:
+            dists = np.abs(valid_indices - invalid_pos)
+            nearest_idx = valid_indices[np.argmin(dists)] if len(dists) > 0 else None
+            if nearest_idx is not None:
+                fixes[invalid_pos] = row[nearest_idx]
+            else:
+                fixes[invalid_pos] = fallback_token
+
+    return fixes
 
 
-def fix_tokens(output, min_valid=0, max_valid=1023, save_original=False, original_path=None, codebook=None):
+def _fix_invalid_tokens_in_row(
+    row, min_valid, max_valid, valid_tokens, fallback_token, use_knn
+):
+    """
+    Given a single row of tokens, fix all invalid entries using:
+      1) KNN-based approach if row isn't too heavily invalid and enough valid points exist.
+      2) Otherwise group invalid tokens into regions and fix them with boundary/position approach.
+    
+    Returns a dict { invalid_index: fixed_value }.
+    """
+    valid_mask, invalid_mask, valid_indices = get_masks_and_indices(row, min_valid, max_valid)
+    invalid_indices = np.where(invalid_mask)[0]
+    
+    # If no invalid tokens, nothing to fix.
+    if len(invalid_indices) == 0:
+        return {}
+
+    # If no valid tokens, fix all invalid with fallback immediately.
+    if len(valid_indices) == 0:
+        return {idx: fallback_token for idx in invalid_indices}
+
+    fixes = {}
+    row_invalid_percent = 100.0 * len(invalid_indices) / len(row)
+    is_high_invalid = row_invalid_percent > 15.0
+
+    # Attempt KNN fix if we have enough valid indices, not too many invalids
+    # and if the user wants to use_knn
+    if use_knn and len(valid_indices) >= 3 and not is_high_invalid:
+        try:
+            X = valid_indices.reshape(-1, 1)
+            knn = NearestNeighbors(n_neighbors=min(3, len(X)))
+            knn.fit(X)
+
+            # Distances, neighbor-indices for each invalid index
+            dist, idx_neighbors = knn.kneighbors(invalid_indices.reshape(-1, 1))
+            weights = 1.0 / (dist + 1e-9)
+            weights /= np.sum(weights, axis=1, keepdims=True)
+
+            for i, inv_idx in enumerate(invalid_indices):
+                neighbor_positions = valid_indices[idx_neighbors[i]]
+                neighbor_tokens = row[neighbor_positions]
+
+                # Weighted “vote” on neighbor tokens:
+                token_score = {}
+                for neighbor_tkn, w in zip(neighbor_tokens, weights[i]):
+                    token_score[neighbor_tkn] = token_score.get(neighbor_tkn, 0.0) + w
+
+                best_token = max(token_score.items(), key=lambda x: x[1])[0]
+                fixes[inv_idx] = best_token
+
+        except Exception:
+            # If KNN fails, we do region-based
+            pass
+
+    # Identify which invalid indices are unfixed (need region-based approach)
+    unfixed = [idx for idx in invalid_indices if idx not in fixes]
+
+    if unfixed:
+        # Group unfixed invalid indices into consecutive regions
+        regions = []
+        cur_region = [unfixed[0]]
+        for idx in unfixed[1:]:
+            if idx == cur_region[-1] + 1:
+                cur_region.append(idx)
+            else:
+                regions.append(cur_region)
+                cur_region = [idx]
+        regions.append(cur_region)
+
+        # Fix each region
+        for reg in regions:
+            region_fixes = _fix_invalid_region(
+                row, reg, valid_indices, fallback_token, min_valid, max_valid
+            )
+            fixes.update(region_fixes)
+
+    return fixes
+
+
+def fix_tokens(
+    output,
+    min_valid=0,
+    max_valid=1023,
+    save_original=False,
+    original_path=None,
+    codebook=None,  # if needed
+    parallel=True,
+    show_progress=True,
+):
     """
     Fix invalid codec tokens using advanced methods that account for non-linear latent spaces.
-    Uses nearest valid embedding search rather than simple linear interpolation.
+    Uses nearest valid embedding search (KNN) if available, and fallback region-based approach.
     
     Args:
-        output: Token array to fix
-        min_valid: Minimum valid token value
-        max_valid: Maximum valid token value
-        save_original: Whether to save the original tokens
-        original_path: Path to save original tokens if save_original is True
-        codebook: Optional codebook for embedding-based fixing (if None, will use statistical methods)
+        output: Token array to fix (1D or 2D).
+        min_valid: Minimum valid token value.
+        max_valid: Maximum valid token value.
+        save_original: Whether to save the original tokens.
+        original_path: Path to save original tokens if save_original is True.
+        codebook: Optional codebook (not actively used in this refactoring, but kept to match the signature).
+        parallel: Whether to use parallel processing for large arrays.
+        show_progress: Whether to show progress bar.
         
     Returns:
-        Fixed token array
+        Fixed token array (2D).
     """
-    # Input validation
     if output is None:
         raise ValueError("Input token array cannot be None")
-    
+
+    # Ensure numpy array
     if not isinstance(output, np.ndarray):
-        try:
-            output = np.array(output)
-            print("Converted input to numpy array")
-        except Exception as e:
-            raise TypeError(f"Input must be convertible to a numpy array: {e}")
-    
+        output = np.array(output)
+
     if output.size == 0:
         raise ValueError("Input token array is empty")
-    
-    # Validate token range parameters
+
+    # Validate min/max
     if min_valid >= max_valid:
-        raise ValueError(f"min_valid ({min_valid}) must be less than max_valid ({max_valid})")
-    
-    # Make sure the shape is appropriate
-    if len(output.shape) != 2:
-        if len(output.shape) == 1:
-            # Handle 1D arrays by reshaping to 2D
-            output = output.reshape(1, -1)
-            print("Reshaped 1D token array to 2D")
-        else:
-            raise ValueError(f"Expected 2D token array, got shape {output.shape}")
-    
+        raise ValueError(f"min_valid ({min_valid}) must be < max_valid ({max_valid})")
+
+    # Reshape to 2D if 1D
+    reshaped = False
+    if output.ndim == 1:
+        output = output.reshape(1, -1)
+        reshaped = True
+
+    # Analyze tokens
+    analysis = analyze_token_issues(output, min_valid, max_valid)
+    if analysis["invalid_count"] == 0:
+        print("No invalid tokens found. Nothing to fix.")
+        return output if not reshaped else output.flatten()
+
+    print(
+        f"Found {analysis['invalid_count']} invalid tokens "
+        f"({analysis['invalid_percent']:.2f}%). "
+        f"Max consecutive invalid: {analysis['consecutive_invalids']}."
+    )
+
+    # Save original if requested
+    if save_original and original_path:
+        try:
+            np.save(original_path, output)
+            print(f"Saved original tokens to {original_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save original tokens: {e}")
+
+    # Copy for fixing
+    fixed_output = copy.deepcopy(output)
+
+    # Gather valid tokens from entire array
+    overall_valid_mask = (fixed_output >= min_valid) & (fixed_output <= max_valid)
+    if not np.any(overall_valid_mask):
+        # If absolutely no valid tokens, just fill with midpoint
+        print("No valid tokens at all in the array. Filling everything with fallback.")
+        fallback = (min_valid + max_valid) // 2
+        return np.full_like(fixed_output, fallback)
+
+    valid_tokens = fixed_output[overall_valid_mask]
+
+    # If valid tokens are sparse, generate synthetic valid tokens
+    if len(valid_tokens) < 10:
+        print(
+            f"WARNING: Very few valid tokens ({len(valid_tokens)}). "
+            "Using fallback approach with synthetic valid tokens."
+        )
+        synthetic = np.linspace(min_valid, max_valid, 100, dtype=int)
+        valid_tokens = np.concatenate([valid_tokens, synthetic]) if len(valid_tokens) else synthetic
+
+    fallback_token = get_fallback_token(valid_tokens, min_valid, max_valid)
+    # Attempt to see if KNN can be used
+    use_knn = True  # We already imported NearestNeighbors at the top
+
+    # Prepare row data
+    row_data = [
+        (i, fixed_output[i], min_valid, max_valid, valid_tokens, fallback_token, use_knn)
+        for i in range(fixed_output.shape[0])
+    ]
+
+    # Process rows in parallel or sequentially
+    def _sequential_fix(rd_list):
+        iterator = tqdm(rd_list) if show_progress else rd_list
+        for row_args in iterator:
+            i, fixes = _process_row_wrapper(row_args)
+            for pos, tok in fixes.items():
+                fixed_output[i, pos] = tok
+
+    def _process_row_wrapper(args):
+        i, row, mn, mx, vt, fb, knn_flag = args
+        fixes = _fix_invalid_tokens_in_row(row, mn, mx, vt, fb, knn_flag)
+        return i, fixes
+
     try:
-        # Analyze the token issues before fixing
-        token_analysis = analyze_token_issues(output)
-        
-        # If no invalid tokens, return original
-        if token_analysis["invalid_count"] == 0:
-            return output
-        
-        # Display analysis results
-        print(f"Found {token_analysis['invalid_count']} invalid tokens ({token_analysis['invalid_percent']:.2f}%)")
-        print(f"Max consecutive invalid tokens: {token_analysis['consecutive_invalids']}")
-        print(f"Rows with invalid tokens: {len(token_analysis['invalid_rows'])}")
-        
-        # Save original for debugging if requested
-        if save_original and original_path:
-            try:
-                np.save(original_path, output)
-                print(f"Saved original tokens to {original_path} for debugging")
-            except Exception as e:
-                print(f"Warning: Failed to save original tokens: {e}")
-    
-        # Create a copy for fixing
-        fixed_output = copy.deepcopy(output)
-        
-        # Extract all valid tokens from the dataset to use as candidates
-        valid_mask = (output >= min_valid) & (output <= max_valid)
-        
-        # Handle case where there are no valid tokens at all
-        if not np.any(valid_mask):
-            print("WARNING: No valid tokens found in input. Using default token values.")
-            # Return array filled with safe middle values
-            return np.full_like(output, (min_valid + max_valid) // 2)
-            
-        valid_tokens = output[valid_mask]
-        
-        # If we have very few valid tokens, use the full valid range as candidates
-        if len(valid_tokens) < 100:
-            valid_tokens = np.arange(min_valid, max_valid + 1)
-        
-        try:
-            # Build statistical model of valid token distribution
-            token_hist, bin_edges = np.histogram(valid_tokens, bins=max(50, max_valid - min_valid + 1))
-            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-        except Exception as e:
-            print(f"Warning: Failed to build token distribution model: {e}")
-            # Fallback to simple array
-            token_hist = None
-            bin_centers = None
-        
-        # For rows with high percentages of invalid tokens, apply advanced smoothing
-        high_invalid_rows = []
-        for i, line in enumerate(output):
-            invalid_count = np.sum((line < min_valid) | (line > max_valid))
-            if invalid_count / len(line) > 0.15:  # If more than 15% of tokens are invalid
-                high_invalid_rows.append(i)
-        
-        # Try to process high-invalid rows
-        try:
-            # Process high-invalid rows
-            fixed_output = _fix_high_invalid_rows(output, fixed_output, high_invalid_rows, 
-                                                min_valid, max_valid, valid_tokens, codebook)
-        except Exception as e:
-            print(f"Warning: Error processing high-invalid rows: {e}")
-            # Fallback for high-invalid rows: use most common valid token
-            for row_idx in high_invalid_rows:
-                line = output[row_idx]
-                invalid_mask = (line < min_valid) | (line > max_valid)
-                # Use most common valid token
-                if len(valid_tokens) > 0:
-                    token_counts = Counter(valid_tokens)
-                    most_common = token_counts.most_common(1)[0][0]
-                    fixed_output[row_idx, invalid_mask] = most_common
-            
-        # Try to process individual tokens
-        try:
-            # Process remaining individual invalid tokens
-            fixed_output = _fix_individual_tokens(output, fixed_output, high_invalid_rows, 
-                                                min_valid, max_valid, valid_tokens, codebook)
-        except Exception as e:
-            print(f"Warning: Error processing individual tokens: {e}")
-            # Fallback for remaining individual tokens: clip to valid range
-            invalid_mask = (fixed_output < min_valid) | (fixed_output > max_valid)
-            if np.any(invalid_mask):
-                # Clip or set to most common value
-                if len(valid_tokens) > 0:
-                    token_counts = Counter(valid_tokens)
-                    most_common = token_counts.most_common(1)[0][0]
-                    fixed_output[invalid_mask] = most_common
+        if parallel and fixed_output.shape[0] > 10 and fixed_output.size > 10000:
+            num_workers = min(cpu_count(), 8)
+            print(f"Using parallel processing with {num_workers} workers.")
+            with Pool(num_workers) as pool:
+                if show_progress:
+                    results = list(tqdm(pool.imap(_process_row_wrapper, row_data), total=len(row_data)))
                 else:
-                    fixed_output[invalid_mask] = (min_valid + max_valid) // 2
-    
-        # Final validation
-        # Analyze the fixed output to ensure all tokens are valid
-        fixed_analysis = analyze_token_issues(fixed_output)
-        if fixed_analysis["invalid_count"] > 0:
-            print(f"WARNING: Still found {fixed_analysis['invalid_count']} invalid tokens after fixing!")
-            # Force any remaining invalid tokens to be valid
-            fixed_output = np.clip(fixed_output, min_valid, max_valid)
+                    results = pool.map(_process_row_wrapper, row_data)
+            for i, fixes in results:
+                for pos, tok in fixes.items():
+                    fixed_output[i, pos] = tok
         else:
-            print(f"Successfully fixed all {token_analysis['invalid_count']} invalid tokens.")
-            
-        # Calculate statistics on how much the tokens changed
-        try:
-            fixed_output = _calculate_fix_statistics(output, fixed_output, token_analysis, min_valid, max_valid)
-        except Exception as e:
-            print(f"Warning: Failed to calculate fix statistics: {e}")
-        
-        return fixed_output
-        
+            _sequential_fix(row_data)
     except Exception as e:
-        print(f"Critical error in fix_tokens: {e}")
-        # Ultimate fallback: return clipped version of input
-        return np.clip(output, min_valid, max_valid)
+        print(f"Parallel processing failed ({e}). Falling back to sequential.")
+        _sequential_fix(row_data)
 
-def _fix_high_invalid_rows(output, fixed_output, high_invalid_rows, min_valid, max_valid, 
-                           valid_tokens, codebook=None):
-    """
-    Apply advanced fixing to rows with high percentage of invalid tokens
-    
-    Args:
-        output: Original token array
-        fixed_output: Array to store fixed tokens
-        high_invalid_rows: List of row indices with high invalid percentages
-        min_valid: Minimum valid token value
-        max_valid: Maximum valid token value
-        valid_tokens: Array of valid tokens to sample from
-        codebook: Optional codebook for embedding-based fixing
-        
-    Returns:
-        Updated fixed_output array
-    """
+    # Clip any remaining invalid tokens as final fallback
+    final_mask = (fixed_output < min_valid) | (fixed_output > max_valid)
+    remaining_invalid = np.sum(final_mask)
+    if remaining_invalid > 0:
+        print(
+            f"WARNING: Still found {remaining_invalid} invalid tokens after fixing; "
+            "they will be clipped."
+        )
+        np.clip(fixed_output, min_valid, max_valid, out=fixed_output)
+    else:
+        print(f"All {analysis['invalid_count']} invalid tokens successfully fixed.")
+
+    # Optionally compare how many valid tokens were changed
     try:
-        # Import optional dependencies
-        from sklearn.ensemble import IsolationForest
-        from sklearn.neighbors import NearestNeighbors
-        use_advanced = True
-    except ImportError:
-        use_advanced = False
-        print("Advanced token fixing unavailable: sklearn not installed")
-    
-    for row_idx in high_invalid_rows:
-        line = output[row_idx]
-        valid_indices = np.where((line >= min_valid) & (line <= max_valid))[0]
-        
-        if len(valid_indices) < 2:
-            # If almost no valid tokens, use the most frequent valid token in the dataset
-            if len(valid_tokens) > 0:
-                # Find the most common valid token
-                token_counts = Counter(valid_tokens)
-                most_common = token_counts.most_common(1)[0][0]
-                fixed_output[row_idx] = np.full_like(line, most_common)
-            else:
-                # Fallback to middle value
-                fixed_output[row_idx] = np.full_like(line, (min_valid + max_valid) // 2)
-            continue
-        
-        # Extract valid tokens and their positions in this row
-        valid_positions = valid_indices
-        valid_row_tokens = line[valid_indices]
-        
-        # Context-aware repair using valid tokens in the row
-        if use_advanced and len(valid_row_tokens) >= 5:
-            # Reshape for KNN
-            X = valid_positions.reshape(-1, 1)
-            y = valid_row_tokens
-            
-            # Build KNN model for token prediction
-            n_neighbors = min(5, len(valid_row_tokens))
-            knn = NearestNeighbors(n_neighbors=n_neighbors)
-            knn.fit(X)
-            
-            # For each invalid token, predict using KNN
-            for j in range(len(line)):
-                if line[j] < min_valid or line[j] > max_valid:
-                    # Query position
-                    query = np.array([[j]])
-                    distances, indices = knn.kneighbors(query)
-                    
-                    # Get neighboring positions and their tokens
-                    neighbor_positions = valid_positions[indices[0]]
-                    neighbor_tokens = valid_row_tokens[indices[0]]
-                    
-                    # Weight by inverse distance
-                    weights = 1.0 / (distances[0] + 1e-5)
-                    weights /= weights.sum()
-                    
-                    # Weighted voting for nearest valid token
-                    token_candidates = {}
-                    for token, weight in zip(neighbor_tokens, weights):
-                        if token in token_candidates:
-                            token_candidates[token] += weight
-                        else:
-                            token_candidates[token] = weight
-                    
-                    # Select token with highest weight
-                    fixed_output[row_idx, j] = max(token_candidates.items(), key=lambda x: x[1])[0]
-        else:
-            # Fallback to simpler approach if advanced methods unavailable
-            for j in range(len(line)):
-                if line[j] < min_valid or line[j] > max_valid:
-                    # Find nearest valid neighbors by position
-                    right_idx = valid_indices[valid_indices > j] if len(valid_indices[valid_indices > j]) > 0 else None
-                    left_idx = valid_indices[valid_indices < j] if len(valid_indices[valid_indices < j]) > 0 else None
-                    
-                    if left_idx is not None and right_idx is not None:
-                        # Get closest neighbors
-                        left_pos = left_idx[-1]
-                        right_pos = right_idx[0]
-                        
-                        # Get tokens at these positions
-                        left_val = line[left_pos]
-                        right_val = line[right_pos]
-                        
-                        # Distance-weighted selection
-                        left_dist = j - left_pos
-                        right_dist = right_pos - j
-                        
-                        if left_dist <= right_dist:
-                            fixed_output[row_idx, j] = left_val  # Favor closer token
-                        else:
-                            fixed_output[row_idx, j] = right_val
-                    elif left_idx is not None:
-                        # Only left valid tokens available
-                        left_pos = left_idx[-1]
-                        fixed_output[row_idx, j] = line[left_pos]
-                    elif right_idx is not None:
-                        # Only right valid tokens available
-                        right_pos = right_idx[0]
-                        fixed_output[row_idx, j] = line[right_pos]
-                    else:
-                        # No valid tokens in this row - use global statistics
-                        fixed_output[row_idx, j] = int(np.median(valid_tokens))
-                
-    return fixed_output
+        original_valid = output[overall_valid_mask]
+        new_valid = fixed_output[overall_valid_mask]
+        preserved = np.sum(original_valid == new_valid)
+        total_valid = len(original_valid)
+        print(
+            f"Preserved {preserved}/{total_valid} originally valid tokens "
+            f"({(preserved / total_valid) * 100:.2f}%)."
+        )
+    except Exception as e:
+        print(f"Failed to compute preservation stats: {e}")
 
-def _fix_individual_tokens(output, fixed_output, high_invalid_rows, min_valid, max_valid, 
-                           valid_tokens, codebook=None):
-    """
-    Fix individual invalid tokens with an approach better suited for neural codec latent spaces,
-    using nearest neighbor search instead of linear interpolation.
-    
-    Args:
-        output: Original token array
-        fixed_output: Array to store fixed tokens
-        high_invalid_rows: List of row indices already processed
-        min_valid: Minimum valid token value
-        max_valid: Maximum valid token value
-        valid_tokens: Array of valid tokens to sample from
-        codebook: Optional codebook for embedding-based fixing
-        
-    Returns:
-        Updated fixed_output array
-    """
-    for i, line in enumerate(output):
-        if i in high_invalid_rows:
-            continue  # Skip rows we've already processed
-        
-        # Find invalid tokens in this row
-        invalid_mask = (line < min_valid) | (line > max_valid)
-        invalid_indices = np.where(invalid_mask)[0]
-        
-        if len(invalid_indices) == 0:
-            continue
-        
-        # Get context for this row
-        valid_mask = ~invalid_mask
-        valid_indices = np.where(valid_mask)[0]
-        
-        # Skip if no valid tokens in this row
-        if len(valid_indices) == 0:
-            # Use global statistics
-            token_counts = Counter(valid_tokens)
-            most_common = token_counts.most_common(1)[0][0]
-            fixed_output[i, invalid_indices] = most_common
-            continue
-        
-        # Prepare data for nearest neighbor search in position space
-        X_valid_pos = valid_indices.reshape(-1, 1)
-        y_valid_tokens = line[valid_indices]
-        
-        # Group adjacent invalid tokens
-        invalid_regions = []
-        current_region = [invalid_indices[0]]
-        
-        for j in range(1, len(invalid_indices)):
-            if invalid_indices[j] == invalid_indices[j-1] + 1:
-                # Continue current region
-                current_region.append(invalid_indices[j])
-            else:
-                # End region and start new one
-                invalid_regions.append(current_region)
-                current_region = [invalid_indices[j]]
-        
-        # Add the last region
-        if current_region:
-            invalid_regions.append(current_region)
-        
-        # Process each invalid region
-        for region in invalid_regions:
-            # For isolated invalid tokens or small regions, use nearest neighbor
-            if len(region) <= 3:
-                for pos in region:
-                    # Find the two closest valid tokens by position
-                    distances = np.abs(valid_indices - pos)
-                    nearest_indices = np.argsort(distances)[:2]
-                    nearest_positions = valid_indices[nearest_indices]
-                    nearest_tokens = line[nearest_positions]
-                    
-                    # Select the token from the nearest valid position
-                    fixed_output[i, pos] = nearest_tokens[0]
-            else:
-                # For larger regions, use a more sophisticated approach
-                # Find valid tokens on both sides of the region
-                region_start, region_end = region[0], region[-1]
-                
-                left_valid = valid_indices[valid_indices < region_start]
-                right_valid = valid_indices[valid_indices > region_end]
-                
-                if len(left_valid) > 0 and len(right_valid) > 0:
-                    # We have valid tokens on both sides
-                    left_pos = left_valid[-1]
-                    right_pos = right_valid[0]
-                    left_token = line[left_pos]
-                    right_token = line[right_pos]
-                    
-                    # Select from valid tokens based on region position
-                    for j, pos in enumerate(region):
-                        # Favor the closer boundary token
-                        region_progress = j / (len(region) - 1) if len(region) > 1 else 0.5
-                        
-                        # Select based on position, but avoiding linear interpolation
-                        # which could create invalid tokens in non-linear latent spaces
-                        if region_progress < 0.5:
-                            fixed_output[i, pos] = left_token
-                        else:
-                            fixed_output[i, pos] = right_token
-                
-                elif len(left_valid) > 0:
-                    # Only valid tokens to the left
-                    left_pos = left_valid[-1]
-                    left_token = line[left_pos]
-                    for pos in region:
-                        fixed_output[i, pos] = left_token
-                
-                elif len(right_valid) > 0:
-                    # Only valid tokens to the right
-                    right_pos = right_valid[0]
-                    right_token = line[right_pos]
-                    for pos in region:
-                        fixed_output[i, pos] = right_token
-                
-                else:
-                    # No valid tokens in this row
-                    for pos in region:
-                        fixed_output[i, pos] = int(np.median(valid_tokens))
-                        
-    return fixed_output
-
-def _calculate_fix_statistics(output, fixed_output, token_analysis, min_valid, max_valid):
-    """
-    Calculate statistics on how the tokens changed during fixing
-    
-    Args:
-        output: Original token array
-        fixed_output: Fixed token array
-        token_analysis: Analysis results from original tokens
-        min_valid: Minimum valid token value
-        max_valid: Maximum valid token value
-        
-    Returns:
-        The fixed_output array (unchanged, just for function chaining)
-    """
-    if token_analysis["invalid_count"] > 0:
-        # Only compare valid tokens in the original to see how much they changed
-        valid_mask = (output >= min_valid) & (output <= max_valid)
-        if np.any(valid_mask):
-            valid_original = output[valid_mask]
-            valid_fixed = fixed_output[valid_mask]
-            
-            # Check if valid tokens were preserved
-            preserved = np.sum(valid_original == valid_fixed)
-            total_valid = np.sum(valid_mask)
-            print(f"Preserved {preserved}/{total_valid} valid tokens ({preserved/total_valid*100:.2f}%)")
-            
-            # Calculate average change in valid tokens that were modified
-            modified_mask = (valid_original != valid_fixed)
-            if np.any(modified_mask):
-                avg_change = np.mean(np.abs(valid_original[modified_mask] - valid_fixed[modified_mask]))
-                print(f"Average change in modified valid tokens: {avg_change:.2f}")
-    
-    return fixed_output 
+    # Reshape back if needed
+    return fixed_output if not reshaped else fixed_output.flatten()
