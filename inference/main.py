@@ -177,13 +177,11 @@ def main():
     stage1_model = AutoModelForCausalLM.from_pretrained(
         args.stage1_model, 
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="eager",
+        load_in_8bit=True,
+        device_map="auto",
     )
-    stage1_model.to(device)
     stage1_model.eval()
-    
-    if torch.__version__ >= "2.0.0":
-        stage1_model = torch.compile(stage1_model)
     
     # Prepare prompt texts
     with open(args.genre_txt, 'r', encoding='utf-8') as f:
@@ -249,6 +247,8 @@ def main():
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True,
+        load_in_8bit=True,
+        use_cache=True,
     )
     
     # Stage 2 inference
