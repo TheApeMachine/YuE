@@ -11,3 +11,4 @@ descript-audiotools>=0.7.2
 descript-audio-codec
 scipy
 accelerate>=0.26.0
+pyloudnorm
