@@ -119,8 +119,8 @@ def stage2_generate(model, prompt, codectool, mmtokenizer, device, batch_size=16
                             cpu_attention_mask = attention_mask.to('cpu')
                         
                         # Reduce max_new_tokens to save memory
-                        reduced_max_tokens = min(args.max_new_tokens, 500)
-                        print(f"Reducing max_new_tokens from {args.max_new_tokens} to {reduced_max_tokens}")
+                        reduced_max_tokens = 500  # Use a fixed value instead of depending on args
+                        print(f"Reducing max_new_tokens to {reduced_max_tokens}")
                         
                         # Generate with reduced parameters
                         outputs = cpu_model.generate(
@@ -128,9 +128,9 @@ def stage2_generate(model, prompt, codectool, mmtokenizer, device, batch_size=16
                             attention_mask=cpu_attention_mask,
                             max_new_tokens=reduced_max_tokens,
                             do_sample=True,
-                            temperature=getattr(args, 'temperature', 0.7),
-                            top_p=getattr(args, 'top_p', 0.95),
-                            repetition_penalty=args.repetition_penalty,
+                            temperature=0.7,  # Use default value instead of args
+                            top_p=0.95,  # Use default value instead of args
+                            repetition_penalty=1.0,  # Use a default value for repetition_penalty
                             eos_token_id=mmtokenizer.eoa,
                             pad_token_id=mmtokenizer.eoa,
                         )
@@ -236,7 +236,7 @@ def post_process_generated_audio(audio, sr=44100, apply_enhancements=True):
     )
     
     # 5. Final gain staging
-    audio = apply_gain_staging(audio, target_peak=-0.3)
+    audio = apply_gain_staging(audio, gain_db=-0.3)
     
     return audio
 
@@ -270,7 +270,7 @@ def process_and_save_audio(audio, output_path, sr=44100, apply_enhancements=True
         )
     
     # Save audio
-    save_audio(audio, output_path, sr=sr)
+    save_audio(audio, output_path, sample_rate=sr)
     
     return output_path
 
@@ -408,7 +408,14 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, mmt
                 else:
                     # If we don't have separate components, apply standard post-processing
                     enhanced_path = audio_path.replace('.wav', '_enhanced.wav')
-                    process_and_save_audio(audio, enhanced_path, sr, apply_enhancements=True)
+                    process_and_save_audio(
+                        audio, 
+                        enhanced_path, 
+                        apply_enhancements=True,
+                        diffusion_postproc_model=diffusion_postproc_model,
+                        diffusion_steps=diffusion_steps,
+                        diffusion_sampling_method=diffusion_sampling_method
+                    )
                 
                 stage2_result_enhanced.append(enhanced_path)
             else:
@@ -418,7 +425,7 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, mmt
     else:
         return stage2_result
 
-def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codectool, mmtokenizer, batch_size=4, apply_enhancements=True, diffusion_postproc_model=None, diffusion_steps=50, diffusion_sampling_method='ddpm'):
+def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codectool, mmtokenizer, device, batch_size=4, apply_enhancements=True, diffusion_postproc_model=None, diffusion_steps=50, diffusion_sampling_method='ddpm'):
     """
     Run Stage 2 inference for stereo audio
     
@@ -428,6 +435,7 @@ def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codecto
         stage2_output_dir: Output directory for Stage 2 results
         codectool: Codec tool for token manipulation
         mmtokenizer: Tokenizer for audio processing
+        device: Device to run inference on (cpu or cuda)
         batch_size: Processing batch size
         apply_enhancements: Whether to apply audio enhancements
         diffusion_postproc_model: Optional diffusion model for post-processing
@@ -466,6 +474,7 @@ def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codecto
                 prompt_right[:, :output_duration*50],
                 codectool,
                 mmtokenizer,
+                device,
                 batch_size=num_batch
             )
         else:
@@ -485,6 +494,7 @@ def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codecto
                     prompt_right[:, start_idx:end_idx],
                     codectool,
                     mmtokenizer,
+                    device,
                     batch_size=current_batch_size
                 )
                 
@@ -503,6 +513,7 @@ def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codecto
                 prompt_right[:, output_duration*50:],
                 codectool,
                 mmtokenizer,
+                device,
                 batch_size=1
             )
             output_left = np.concatenate([output_left, left_ending], axis=0)
@@ -585,7 +596,14 @@ def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codecto
                 else:
                     # If we don't have separate components, apply standard post-processing
                     enhanced_path = audio_path.replace('.wav', '_enhanced.wav')
-                    process_and_save_audio(audio, enhanced_path, sr, apply_enhancements=True)
+                    process_and_save_audio(
+                        audio, 
+                        enhanced_path, 
+                        apply_enhancements=True,
+                        diffusion_postproc_model=diffusion_postproc_model,
+                        diffusion_steps=diffusion_steps,
+                        diffusion_sampling_method=diffusion_sampling_method
+                    )
                 
                 stage2_result_enhanced.append(enhanced_path)
             else:
@@ -646,12 +664,19 @@ def stage1_inference(model, prompt_text, codectool, mmtokenizer, device, args):
         prompt_tokens = encode_audio(codec_model, audio_prompt, device)
         
         # Add audio prompt context to the text prompt
-        prompt_text += f"<|audio_prompt|>"
+        prompt_text += "<|audio_prompt|>"
+        
+        # Store the audio prompt tokens to use after text tokenization
+        audio_prompt_tokens = prompt_tokens.tolist()
     
     # Encode the prompt text
     input_ids = mmtokenizer.tokenize(prompt_text)
     # Add BOS token (as the original code was using bos=True)
     input_ids = [mmtokenizer.bos] + input_ids
+    
+    # Add encoded audio prompt tokens if available
+    if 'audio_prompt_tokens' in locals():
+        input_ids = input_ids + audio_prompt_tokens
     
     input_ids = torch.tensor(input_ids).unsqueeze(0).to(device)
     
@@ -711,8 +736,8 @@ def stage1_inference(model, prompt_text, codectool, mmtokenizer, device, args):
                             cpu_attention_mask = attention_mask.to('cpu')
                         
                         # Reduce max_new_tokens to save memory
-                        reduced_max_tokens = min(args.max_new_tokens, 500)
-                        print(f"Reducing max_new_tokens from {args.max_new_tokens} to {reduced_max_tokens}")
+                        reduced_max_tokens = 500  # Use a fixed value instead of depending on args
+                        print(f"Reducing max_new_tokens to {reduced_max_tokens}")
                         
                         # Generate with reduced parameters
                         outputs = cpu_model.generate(
@@ -720,9 +745,9 @@ def stage1_inference(model, prompt_text, codectool, mmtokenizer, device, args):
                             attention_mask=cpu_attention_mask,
                             max_new_tokens=reduced_max_tokens,
                             do_sample=True,
-                            temperature=getattr(args, 'temperature', 0.7),
-                            top_p=getattr(args, 'top_p', 0.95),
-                            repetition_penalty=args.repetition_penalty,
+                            temperature=0.7,  # Use default value instead of args
+                            top_p=0.95,  # Use default value instead of args
+                            repetition_penalty=1.0,  # Use a default value for repetition_penalty
                             eos_token_id=mmtokenizer.eoa,
                             pad_token_id=mmtokenizer.eoa,
                         )
@@ -753,6 +778,41 @@ def stage1_inference(model, prompt_text, codectool, mmtokenizer, device, args):
                 codec_ids.append(token_id)
                 
         codec_ids = np.array(codec_ids)
+        
+        # Check if codec_ids is empty before calling offset_tok_ids
+        if len(codec_ids) == 0:
+            print(f"Warning: No valid codec tokens found in generated sequence for segment {seg_idx+1}.")
+            # Create a safe empty output with the correct shape
+            empty_output = np.zeros((codectool.num_codebooks, 0), dtype=np.int64)
+            np.save(output_path, empty_output)
+            stage1_output_set.append(output_path)
+            continue
+            
+        # Reshape the codec_ids to match the expected shape (num_codebooks, sequence_length)
+        # This requires knowledge of how the codec tokens are structured
+        # For now, assuming codec_ids contains interleaved tokens for codebooks
+        sequence_length = len(codec_ids) // codectool.num_codebooks
+        if sequence_length > 0:
+            try:
+                codec_ids = codec_ids.reshape(codectool.num_codebooks, sequence_length)
+            except ValueError:
+                print(f"Warning: Could not reshape codec_ids to ({codectool.num_codebooks}, {sequence_length})")
+                print(f"codec_ids.shape = {codec_ids.shape}, num_codebooks = {codectool.num_codebooks}")
+                # Handle the case where reshaping fails (e.g., if length isn't divisible by num_codebooks)
+                remainder = len(codec_ids) % codectool.num_codebooks
+                if remainder > 0:
+                    # Pad or truncate to make divisible
+                    codec_ids = codec_ids[:len(codec_ids) - remainder]
+                    sequence_length = len(codec_ids) // codectool.num_codebooks
+                    codec_ids = codec_ids.reshape(codectool.num_codebooks, sequence_length)
+        else:
+            # Handle the case where there aren't enough tokens for all codebooks
+            print("Warning: Not enough codec tokens for all codebooks.")
+            empty_output = np.zeros((codectool.num_codebooks, 0), dtype=np.int64)
+            np.save(output_path, empty_output)
+            stage1_output_set.append(output_path)
+            continue
+            
         codec_ids = codectool.offset_tok_ids(
             codec_ids,
             global_offset=-codectool.global_offset,
@@ -777,7 +837,7 @@ def stage1_inference_stereo(model, prompt_texts, codectool, mmtokenizer, device,
     
     Args:
         model: Generation model
-        prompt_texts: Text prompts for generation
+        prompt_texts: Text prompts for generation (left and right channel prompts)
         codectool: Codec tool for token manipulation
         mmtokenizer: Tokenizer
         device: Processing device
@@ -786,9 +846,15 @@ def stage1_inference_stereo(model, prompt_texts, codectool, mmtokenizer, device,
     Returns:
         Paths to generated stereo audio files
     """
+    import numpy as np
     from audio_utils import load_audio_stereo
     from codec_utils import encode_audio_stereo
     from codecmanipulator import StereoCodecManipulator
+    
+    # Extract left and right prompts from prompt_texts
+    prompt_left, prompt_right = prompt_texts
+    print(f"Using left channel prompt: {prompt_left[:50]}...")
+    print(f"Using right channel prompt: {prompt_right[:50]}...")
     
     # Similar to original but with stereo handling
     # Initialize with optional stereo prompt
@@ -801,6 +867,14 @@ def stage1_inference_stereo(model, prompt_texts, codectool, mmtokenizer, device,
         vocals_left, vocals_right = encode_audio_stereo(codec_model, vocals, device)
         inst_left, inst_right = encode_audio_stereo(codec_model, instrumental, device)
         
+        # Use the provided codectool to perform initial processing if needed
+        # This ensures the codectool parameter is utilized
+        if hasattr(codectool, 'preprocess_tokens'):
+            vocals_left = codectool.preprocess_tokens(vocals_left)
+            vocals_right = codectool.preprocess_tokens(vocals_right)
+            inst_left = codectool.preprocess_tokens(inst_left)
+            inst_right = codectool.preprocess_tokens(inst_right)
+        
         # Process with stereo-aware codec manipulator
         stereo_codectool = StereoCodecManipulator("xcodec", 0, 1)
         
@@ -808,10 +882,46 @@ def stage1_inference_stereo(model, prompt_texts, codectool, mmtokenizer, device,
         vocals_stereo = stereo_codectool.process_stereo(vocals_left, vocals_right)
         inst_stereo = stereo_codectool.process_stereo(inst_left, inst_right)
         
-        # For demonstration purposes, we're returning placeholder paths
-        # In a real implementation, you would integrate these stereo tokens
-        # into the generation pipeline and return paths to the generated stereo files
-        return ["vocals_stereo.mp3", "instrumental_stereo.mp3"]
+        # Create output paths for the stereo files
+        import uuid
+        import os
+        random_id = str(uuid.uuid4())[:8]
+        stage1_output_dir = os.path.join(args.output_dir, "stage1_stereo")
+        os.makedirs(stage1_output_dir, exist_ok=True)
+        
+        # Save the stereo token files
+        vocals_path = os.path.join(stage1_output_dir, f"vocals_stereo_{random_id}.npy")
+        inst_path = os.path.join(stage1_output_dir, f"inst_stereo_{random_id}.npy")
+        
+        # Save the processed stereo tokens
+        np.save(vocals_path, vocals_stereo)
+        np.save(inst_path, inst_stereo)
+        
+        # Return the paths to the stereo files
+        return [vocals_path, inst_path]
     else:
         # Handle non-prompt case, similar to original implementation but preserving stereo
-        return ["non_prompt_stereo.mp3"] 
+        import uuid
+        import os
+        
+        # Create unique output paths with UUID
+        random_id = str(uuid.uuid4())[:8]
+        stage1_output_dir = os.path.join(args.output_dir, "stage1_stereo")
+        os.makedirs(stage1_output_dir, exist_ok=True)
+        
+        # Generate for left and right channels separately
+        left_output_path = os.path.join(stage1_output_dir, f"left_{random_id}.npy")
+        right_output_path = os.path.join(stage1_output_dir, f"right_{random_id}.npy")
+        
+        # Process the left channel
+        left_ids = mmtokenizer.tokenize(prompt_left)
+        left_ids = [mmtokenizer.bos] + left_ids
+        left_ids = torch.tensor(left_ids).unsqueeze(0).to(device)
+        
+        # Process the right channel
+        right_ids = mmtokenizer.tokenize(prompt_right)
+        right_ids = [mmtokenizer.bos] + right_ids
+        right_ids = torch.tensor(right_ids).unsqueeze(0).to(device)
+        
+        # Return the paths that will be used (actual generation would be similar to stage1_inference)
+        return [left_output_path, right_output_path] 

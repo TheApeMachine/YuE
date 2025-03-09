@@ -8,13 +8,15 @@ import numpy as np
 # Import our enhanced mixing functions
 from audio_mixing import process_files_with_enhancements, enhanced_audio_mix
 
-def load_audio_mono(filepath, sampling_rate=16000):
+def load_audio_mono(filepath, sampling_rate=16000, start_time=None, end_time=None):
     """
     Load audio file with mono channel
     
     Args:
         filepath: Path to audio file
         sampling_rate: Target sampling rate
+        start_time: Optional start time in seconds to load from
+        end_time: Optional end time in seconds to load until
     
     Returns:
         Tensor of shape [1, samples]
@@ -24,11 +26,24 @@ def load_audio_mono(filepath, sampling_rate=16000):
     # Convert to mono if stereo
     if audio.shape[0] > 1:
         audio = torch.mean(audio, dim=0, keepdim=True)
+    
+    # Apply time windowing if specified
+    if start_time is not None or end_time is not None:
+        # Convert time to samples
+        start_sample = int(sr * (start_time or 0))
         
-    # Resample if needed
+        # If end_time is None, use the full length
+        if end_time is None:
+            end_sample = audio.shape[1]
+        else:
+            end_sample = min(int(sr * end_time), audio.shape[1])
+            
+        # Extract the specified segment
+        audio = audio[:, start_sample:end_sample]
+    
+    # Resample if necessary
     if sr != sampling_rate:
-        resampler = Resample(orig_freq=sr, new_freq=sampling_rate)
-        audio = resampler(audio)
+        audio = torchaudio.functional.resample(audio, sr, sampling_rate)
     
     return audio
 
@@ -145,7 +160,6 @@ def apply_dither(audio, bits=16, dither_type='tpdf', noise_shaping=True):
     if noise_shaping:
         # Simple error feedback (first-order noise shaping)
         # Process each channel separately
-        error_feedback = torch.zeros_like(output)
         
         # Need to process sample by sample for error feedback
         if output.dim() > 1:
@@ -214,19 +228,35 @@ def save_audio_with_dithering(audio, file_path, sample_rate=44100, bits=16, dith
     
     print(f"Saved audio to {file_path} with {bits}-bit depth and {dither_type} dithering")
 
-def load_audio_stereo(file_path, target_sr=None):
+def load_audio_stereo(file_path, target_sr=None, start_time=None, end_time=None):
     """
     Load audio file and ensure it's stereo
     
     Args:
         file_path: Path to audio file
         target_sr: Target sample rate (if None, use original)
+        start_time: Optional start time in seconds to load from
+        end_time: Optional end time in seconds to load until
         
     Returns:
         Stereo audio tensor and sample rate
     """
     # Load audio
     audio, sr = torchaudio.load(file_path)
+    
+    # Apply time windowing if specified
+    if start_time is not None or end_time is not None:
+        # Convert time to samples
+        start_sample = int(sr * (start_time or 0))
+        
+        # If end_time is None, use the full length
+        if end_time is None:
+            end_sample = audio.shape[1]
+        else:
+            end_sample = min(int(sr * end_time), audio.shape[1])
+            
+        # Extract the specified segment
+        audio = audio[:, start_sample:end_sample]
     
     # Resample if needed
     if target_sr is not None and sr != target_sr:
