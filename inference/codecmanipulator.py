@@ -140,11 +140,7 @@ class CodecManipulator(object):
         if n_quantizer!=self.num_codebooks:
             return einops.rearrange(x, '(T K) -> K T', K=n_quantizer)
         return einops.rearrange(x, '(T K) -> K T', K=self.num_codebooks)
-    
-    # def check_codec_type_from_path(self, path):
-    #     if self.codec_type == "hifi16k":
-    #         assert "academicodec_hifi_16k_320d_large_uni" in path
-    
+        
     def get_codec_type_from_range(self, ids):
         ids_range = [ids.min(), ids.max()]
         codec_range = self.mm_v0_2_cfg["codec_range"]
@@ -160,7 +156,6 @@ class CodecManipulator(object):
             data = npy
         else:
             raise ValueError(f"not supported type: {type(npy)}")
-        # data = data.squeeze()
 
         assert len(data.shape)==2,  f'data shape: {data.shape} is not (n_codebook, seq_len)'
         data = self.offset_tok_ids(
@@ -202,3 +197,102 @@ class CodecManipulator(object):
     
     def sep_ids(self):
         return self.sep_ids
+
+class StereoCodecManipulator(CodecManipulator):
+    """Extension of CodecManipulator to handle stereo audio tokens"""
+    
+    def __init__(self, codec_type, quantizer_begin=None, n_quantizer=None, teacher_forcing=False, data_feature="codec"):
+        """
+        Initialize the StereoCodecManipulator
+        
+        Args:
+            codec_type: Type of codec to use
+            quantizer_begin: Start quantizer index
+            n_quantizer: Number of quantizers to use
+            teacher_forcing: Whether to use teacher forcing
+            data_feature: Data feature type
+        """
+        super().__init__(codec_type, quantizer_begin, n_quantizer, teacher_forcing, data_feature)
+        # Define dedicated stereo channel markers
+        self.special_tokens = self.mm_v0_2_cfg["special_tokens"]
+        self.left_marker = self.special_tokens["<s_local>"]
+        self.right_marker = self.special_tokens["<s_global>"]
+    
+    def process_stereo(self, left_codes, right_codes):
+        """
+        Process left and right channel codes and interleave them
+        
+        Args:
+            left_codes: Encoded tokens for left channel
+            right_codes: Encoded tokens for right channel
+            
+        Returns:
+            Combined stereo tokens with channel markers
+        """
+        # Add channel markers to distinguish left/right
+        left_tokens = self.npy2ids(left_codes[0])
+        right_tokens = self.npy2ids(right_codes[0])
+        
+        # Interleave with special channel markers
+        # Format as: [LEFT_MARKER] [left_tokens] [RIGHT_MARKER] [right_tokens]
+        stereo_tokens = [self.left_marker] + left_tokens + [self.right_marker] + right_tokens
+        
+        return stereo_tokens
+    
+    def deprocess_stereo(self, stereo_tokens):
+        """
+        Split interleaved stereo tokens back into separate channels
+        
+        Args:
+            stereo_tokens: Combined stereo tokens
+            
+        Returns:
+            Left and right channel tokens
+        """
+        # Find marker positions
+        try:
+            left_start = stereo_tokens.index(self.left_marker) + 1
+        except ValueError:
+            print("Warning: Left channel marker not found, using position 0")
+            left_start = 0
+            
+        try:
+            right_start = stereo_tokens.index(self.right_marker) + 1
+        except ValueError:
+            print("Warning: Right channel marker not found, using midpoint")
+            right_start = len(stereo_tokens) // 2
+        
+        # Extract tokens for each channel
+        if self.right_marker in stereo_tokens[left_start:]:
+            right_idx = stereo_tokens[left_start:].index(self.right_marker) + left_start
+            left_tokens = stereo_tokens[left_start:right_idx]
+        else:
+            # If right marker not found after left marker, use the first half for left
+            mid_point = (len(stereo_tokens) - left_start) // 2 + left_start
+            left_tokens = stereo_tokens[left_start:mid_point]
+            
+        right_tokens = stereo_tokens[right_start:]
+        
+        # Validate token types and ranges
+        if left_tokens and right_tokens:
+            # Convert back to numpy arrays
+            left_data = self.ids2npy(left_tokens)
+            right_data = self.ids2npy(right_tokens)
+            
+            return left_data, right_data
+        else:
+            # Create default empty arrays if either channel is missing
+            empty_array = np.zeros((self.num_codebooks, 1), dtype=np.int32)
+            if not left_tokens:
+                print("Warning: No left channel tokens found, using empty array")
+                left_data = empty_array 
+            else:
+                left_data = self.ids2npy(left_tokens)
+                
+            if not right_tokens:
+                print("Warning: No right channel tokens found, using empty array")
+                right_data = empty_array
+            else:
+                right_data = self.ids2npy(right_tokens)
+                
+            return left_data, right_data

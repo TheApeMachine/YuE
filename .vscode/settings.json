@@ -1,0 +1,3 @@
+{
+  "python.analysis.extraPaths": ["./inference/xcodec_mini_infer"]
+}
