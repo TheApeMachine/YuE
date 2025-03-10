@@ -188,7 +188,7 @@ def stage2_generate_stereo(model, prompt_left, prompt_right, codectool, mmtokeni
     # Return both channels
     return left_output, right_output
 
-def post_process_generated_audio(audio, sr=44100, apply_enhancements=True):
+def post_process_generated_audio(audio, sr=44100, apply_enhancements=True, audio_processing_level="full"):
     """
     Apply audio mixing enhancements to generated audio
     
@@ -196,6 +196,7 @@ def post_process_generated_audio(audio, sr=44100, apply_enhancements=True):
         audio: Generated audio tensor (mono or stereo)
         sr: Sample rate
         apply_enhancements: Whether to apply enhancements
+        audio_processing_level: Level of audio post-processing to apply ("minimal", "standard", "full")
         
     Returns:
         Enhanced audio
@@ -207,11 +208,19 @@ def post_process_generated_audio(audio, sr=44100, apply_enhancements=True):
     if audio is None or (isinstance(audio, torch.Tensor) and audio.numel() == 0):
         return audio
     
+    # If audio is a numpy array, convert to tensor for processing
+    if isinstance(audio, np.ndarray):
+        audio = torch.from_numpy(audio).float()
+    
     # 1. Convert to stereo if mono
     if audio.dim() == 1 or (audio.dim() > 1 and audio.shape[0] == 1):
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
         audio = audio.repeat(2, 1)
+    
+    # For minimal processing, just return stereo conversion
+    if audio_processing_level == "minimal":
+        return audio
     
     # 2. Apply phase alignment between channels to improve stereo image
     if audio.shape[0] > 1:
@@ -223,58 +232,96 @@ def post_process_generated_audio(audio, sr=44100, apply_enhancements=True):
         # Reconstruct stereo signal with aligned phases
         audio = torch.cat([reference, aligned_channel], dim=0)
     
-    # 3. Apply stereo width enhancement
-    audio = enhance_stereo_width(audio, width=1.3)
+    # Apply different levels of processing based on audio_processing_level
+    if audio_processing_level == "standard":
+        # Moderate stereo width enhancement
+        audio = enhance_stereo_width(audio, width=1.15)
+        
+        # Apply simpler multi-band compression for balanced dynamics
+        audio = multi_band_compression(
+            audio,
+            bands=[(0, 250), (250, 8000), (8000, 22050)],  # Fewer bands
+            thresholds=[-22, -18, -16],
+            ratios=[2.0, 1.8, 1.5],
+            sr=sr
+        )
+    else:  # "full" processing
+        # 3. Apply stereo width enhancement
+        audio = enhance_stereo_width(audio, width=1.3)
+        
+        # 4. Apply multi-band compression for balanced dynamics
+        audio = multi_band_compression(
+            audio,
+            bands=[(0, 250), (250, 2000), (2000, 8000), (8000, 22050)],
+            thresholds=[-24, -18, -18, -16],
+            ratios=[2.5, 2.0, 1.8, 1.5],
+            sr=sr
+        )
     
-    # 4. Apply multi-band compression for balanced dynamics
-    audio = multi_band_compression(
-        audio,
-        bands=[(0, 250), (250, 2000), (2000, 8000), (8000, 22050)],
-        thresholds=[-24, -18, -18, -16],
-        ratios=[2.5, 2.0, 1.8, 1.5],
-        sr=sr
-    )
-    
-    # 5. Final gain staging
+    # 5. Final gain staging (apply to all levels except minimal)
     audio = apply_gain_staging(audio, gain_db=-0.3)
     
     return audio
 
-def process_and_save_audio(audio, output_path, sr=44100, apply_enhancements=True, diffusion_postproc_model=None, diffusion_steps=50, diffusion_sampling_method='ddpm'):
+def process_and_save_audio(
+    audio, 
+    output_path, 
+    codectool, 
+    sr=44100, 
+    apply_enhancements=True, 
+    diffusion_postproc_model=None, 
+    diffusion_steps=50, 
+    diffusion_sampling_method='ddpm', 
+    audio_processing_level="full"
+):
     """
     Process and save generated audio
     
     Args:
-        audio: Audio data to process
-        output_path: Path to save processed audio
+        audio: Generated audio data
+        output_path: Path to save the audio
+        codectool: Codec tool for audio processing
         sr: Sample rate
-        apply_enhancements: Whether to apply enhancement algorithms
+        apply_enhancements: Whether to apply audio enhancements
         diffusion_postproc_model: Optional diffusion model for post-processing
         diffusion_steps: Number of steps for diffusion process
         diffusion_sampling_method: Sampling method for diffusion
+        audio_processing_level: Level of audio post-processing to apply
         
     Returns:
-        Path to saved audio file
+        Path to processed audio
     """
-    # Apply standard enhancements if needed
-    if apply_enhancements:
-        audio = post_process_generated_audio(audio, sr=sr, apply_enhancements=True)
-
-    # Apply diffusion-based post-processing if model is provided
+    # Convert from tensor or numpy array to numpy if needed
+    if isinstance(audio, torch.Tensor):
+        audio = audio.cpu().numpy()
+    
+    # Save the codec tokens or intermediate format if needed
+    np.save(output_path, audio)
+    
+    # Decode to audio waveform
+    audio = codectool.ids2npy(audio)
+    
+    # Apply diffusion post-processing if available
     if diffusion_postproc_model is not None:
-        print("Applying diffusion-based audio enhancement...")
-        audio = diffusion_postproc_model.enhance_audio(
+        print("Applying diffusion post-processing...")
+        audio = diffusion_postproc_model.denoise(
             audio, 
             steps=diffusion_steps,
             sampling_method=diffusion_sampling_method
         )
     
-    # Save audio
-    save_audio(audio, output_path, sample_rate=sr)
+    # Apply audio enhancements
+    if apply_enhancements:
+        print(f"Applying audio enhancements (level: {audio_processing_level})...")
+        audio = post_process_generated_audio(audio, sr=sr, audio_processing_level=audio_processing_level)
+    
+    # Save the audio
+    wav_output_path = output_path.replace('.npy', '.wav')
+    save_audio(audio, wav_output_path, sample_rate=sr)
     
     return output_path
 
-def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, mmtokenizer, device, batch_size=4, apply_enhancements=True, diffusion_postproc_model=None, diffusion_steps=50, diffusion_sampling_method='ddpm'):
+def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, mmtokenizer, device, batch_size=4, apply_enhancements=True, diffusion_postproc_model=None, diffusion_steps=50, diffusion_sampling_method='ddpm', chunk_size=None, audio_processing_level="full"):
     """
     Run Stage 2 inference
     
@@ -290,6 +337,8 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, mmt
         diffusion_postproc_model: Optional diffusion model for post-processing
         diffusion_steps: Number of steps for diffusion process
         diffusion_sampling_method: Sampling method for diffusion
+        chunk_size: Maximum number of tokens to process in one chunk (reduces memory usage)
+        audio_processing_level: Level of audio post-processing to apply
         
     Returns:
         Paths to generated audio files
@@ -310,122 +359,100 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, codectool, mmt
         output_duration = prompt.shape[-1] // 50 // 6 * 6
         num_batch = output_duration // 6
         
-        if num_batch <= batch_size:
-            # Generate audio from codec tokens
+        # Determine if we need to use chunked processing
+        if chunk_size is not None and chunk_size > 0:
+            # Use explicit chunking regardless of batch size
+            tokens_per_segment = 300  # 6 seconds of audio at 50 tokens/second
+            max_segments_per_chunk = chunk_size // tokens_per_segment
+            
+            if max_segments_per_chunk == 0:
+                print(f"Warning: chunk_size {chunk_size} is too small, using minimum chunk size of {tokens_per_segment}")
+                max_segments_per_chunk = 1
+                
+            print(f"Using chunked processing: {max_segments_per_chunk} segments per chunk")
+            
+            outputs = []
+            for j in range(0, num_batch, max_segments_per_chunk):
+                end_segment = min(j + max_segments_per_chunk, num_batch)
+                segments_in_chunk = end_segment - j
+                
+                start_idx = j * 300
+                end_idx = end_segment * 300
+                
+                print(f"Processing chunk {j//max_segments_per_chunk + 1}: segments {j+1}-{end_segment} ({segments_in_chunk} segments)")
+                
+                # Generate this chunk
+                chunk_output = stage2_generate(
+                    model, 
+                    prompt[:, start_idx:end_idx], 
+                    codectool, 
+                    mmtokenizer, 
+                    device, 
+                    batch_size=min(segments_in_chunk, batch_size)
+                )
+                outputs.append(chunk_output)
+                
+                # Free up memory
+                torch.cuda.empty_cache()
+            
+            # Combine all chunks
+            output = torch.cat(outputs, dim=0)
+            
+        elif num_batch <= batch_size:
+            # Generate audio from codec tokens (standard mode)
             output = stage2_generate(model, prompt[:, :output_duration*50], codectool, mmtokenizer, device, batch_size=num_batch)
         else:
             # If num_batch is greater than batch_size, process in chunks of batch_size
             outputs = []
-            for i in range(0, num_batch, batch_size):
-                start_idx = i * 300
-                end_idx = min((i + batch_size) * 300, output_duration*50)
+            for j in range(0, num_batch, batch_size):
+                start_idx = j * 300
+                end_idx = min((j + batch_size) * 300, output_duration*50)
                 current_batch_size = (end_idx - start_idx + 299) // 300
                 
                 # Generate this chunk
                 chunk = stage2_generate(
-                    model,
-                    prompt[:, start_idx:end_idx],
-                    codectool,
-                    mmtokenizer,
-                    device,
+                    model, 
+                    prompt[:, start_idx:end_idx], 
+                    codectool, 
+                    mmtokenizer, 
+                    device, 
                     batch_size=current_batch_size
                 )
                 outputs.append(chunk)
             
-            # Concatenate all chunks
-            output = np.concatenate(outputs, axis=0)
+            # Combine all chunks
+            output = torch.cat(outputs, dim=0)
         
-        # Process the ending part of the prompt if necessary
-        if output_duration*50 != prompt.shape[-1]:
-            ending = stage2_generate(model, prompt[:, output_duration*50:], codectool, mmtokenizer, device, batch_size=1)
-            output = np.concatenate([output, ending], axis=0)
-        
-        output = codectool.ids2npy(output)
-
-        # Fix invalid tokens using the token_fixer module
-        original_path = output_filename.replace('.npy', '_original.npy') if output_filename.endswith('.npy') else f"{output_filename}_original.npy"
-        fixed_output = fix_tokens(output, min_valid=0, max_valid=1023, save_original=True, original_path=original_path)
-        
-        # Process and save the output
-        processed_path = process_and_save_audio(
-            fixed_output, 
+        # Process and save audio
+        output_path = process_and_save_audio(
+            output, 
             output_filename, 
+            codectool,
             apply_enhancements=apply_enhancements,
             diffusion_postproc_model=diffusion_postproc_model,
             diffusion_steps=diffusion_steps,
-            diffusion_sampling_method=diffusion_sampling_method
+            diffusion_sampling_method=diffusion_sampling_method,
+            audio_processing_level=audio_processing_level
         )
-        
-        stage2_result.append(processed_path)
+        stage2_result.append(output_path)
     
-    if apply_enhancements:
-        stage2_result_enhanced = []
-        for output_path in stage2_result:
-            # Assuming the output path is the audio file path
-            audio_path = output_path.replace('.npy', '.wav')  # Adjust this based on actual file naming
-            
-            # Load the audio
-            if os.path.exists(audio_path):
-                audio, sr = torchaudio.load(audio_path)
-                
-                # Check if we have both vocal and instrumental components
-                # (This would need to be adapted based on your actual project structure)
-                vocal_path = audio_path.replace('.wav', '_vocal.wav')
-                instrumental_path = audio_path.replace('.wav', '_instrumental.wav')
-                
-                if os.path.exists(vocal_path) and os.path.exists(instrumental_path):
-                    # If we have both components, use the enhanced_audio_mix function
-                    vocal, _ = torchaudio.load(vocal_path)
-                    instrumental, _ = torchaudio.load(instrumental_path)
-                    
-                    # Define mixing parameters
-                    mix_params = {
-                        'vocal_gain': 1.0,
-                        'instrumental_gain': 0.8,
-                        'target_lufs': -16.0,
-                        'vocal_compression': {
-                            'threshold': -20.0,
-                            'ratio': 2.0,
-                            'attack': 0.005,
-                            'release': 0.05
-                        },
-                        'sidechain': {
-                            'enabled': True,
-                            'threshold': -24.0,
-                            'ratio': 2.5
-                        },
-                        'stereo_width': 1.2,
-                        'pan_position': 0.0,
-                        'phase_align': True
-                    }
-                    
-                    # Apply advanced mixing
-                    mixed_audio = enhanced_audio_mix(vocal, instrumental, mix_params, sr)
-                    
-                    # Save the enhanced mixed audio
-                    enhanced_path = audio_path.replace('.wav', '_enhanced.wav')
-                    torchaudio.save(enhanced_path, mixed_audio, sr)
-                else:
-                    # If we don't have separate components, apply standard post-processing
-                    enhanced_path = audio_path.replace('.wav', '_enhanced.wav')
-                    process_and_save_audio(
-                        audio, 
-                        enhanced_path, 
-                        apply_enhancements=True,
-                        diffusion_postproc_model=diffusion_postproc_model,
-                        diffusion_steps=diffusion_steps,
-                        diffusion_sampling_method=diffusion_sampling_method
-                    )
-                
-                stage2_result_enhanced.append(enhanced_path)
-            else:
-                stage2_result_enhanced.append(output_path)
-        
-        return stage2_result_enhanced
-    else:
-        return stage2_result
+    return stage2_result
 
-def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codectool, mmtokenizer, device, batch_size=4, apply_enhancements=True, diffusion_postproc_model=None, diffusion_steps=50, diffusion_sampling_method='ddpm'):
+def stage2_inference_stereo(
+    model, 
+    stage1_output_set, 
+    stage2_output_dir, 
+    codectool, 
+    mmtokenizer, 
+    device, 
+    batch_size=4, 
+    apply_enhancements=True, 
+    diffusion_postproc_model=None, 
+    diffusion_steps=50, 
+    diffusion_sampling_method='ddpm', 
+    chunk_size=None, 
+    audio_processing_level="full"
+):
     """
     Run Stage 2 inference for stereo audio
     
@@ -441,6 +468,8 @@ def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codecto
         diffusion_postproc_model: Optional diffusion model for post-processing
         diffusion_steps: Number of steps for diffusion process
         diffusion_sampling_method: Sampling method for diffusion
+        chunk_size: Maximum number of tokens to process in one chunk (reduces memory usage)
+        audio_processing_level: Level of audio post-processing to apply
         
     Returns:
         Paths to generated stereo audio files
@@ -481,25 +510,60 @@ def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codecto
             # Process in chunks
             segments_left = []
             segments_right = []
-            num_segments = (num_batch // batch_size) + (1 if num_batch % batch_size != 0 else 0)
             
-            for seg in range(num_segments):
-                start_idx = seg * batch_size * 300
-                end_idx = min((seg + 1) * batch_size * 300, output_duration*50)
-                current_batch_size = batch_size if seg != num_segments-1 or num_batch % batch_size == 0 else num_batch % batch_size
+            # Determine if we need to use chunked processing based on chunk_size
+            if chunk_size is not None and chunk_size > 0:
+                # Use explicit chunking with the specified chunk size
+                tokens_per_segment = 300  # 6 seconds of audio at 50 tokens/second
+                max_segments_per_chunk = chunk_size // tokens_per_segment
                 
-                left, right = stage2_generate_stereo(
-                    model,
-                    prompt_left[:, start_idx:end_idx],
-                    prompt_right[:, start_idx:end_idx],
-                    codectool,
-                    mmtokenizer,
-                    device,
-                    batch_size=current_batch_size
-                )
+                if max_segments_per_chunk == 0:
+                    print(f"Warning: chunk_size {chunk_size} is too small, using minimum chunk size of {tokens_per_segment}")
+                    max_segments_per_chunk = 1
+                    
+                print(f"Using chunked processing: {max_segments_per_chunk} segments per chunk")
                 
-                segments_left.append(left)
-                segments_right.append(right)
+                # Process with more granular chunking based on chunk_size
+                for j in range(0, num_batch, max_segments_per_chunk):
+                    end_segment = min(j + max_segments_per_chunk, num_batch)
+                    segments_in_chunk = end_segment - j
+                    
+                    start_idx = j * 300
+                    end_idx = end_segment * 300
+                    
+                    left, right = stage2_generate_stereo(
+                        model,
+                        prompt_left[:, start_idx:end_idx],
+                        prompt_right[:, start_idx:end_idx],
+                        codectool,
+                        mmtokenizer,
+                        device,
+                        batch_size=segments_in_chunk
+                    )
+                    
+                    segments_left.append(left)
+                    segments_right.append(right)
+            else:
+                # Use the default batch-based chunking
+                num_segments = (num_batch // batch_size) + (1 if num_batch % batch_size != 0 else 0)
+                
+                for seg in range(num_segments):
+                    start_idx = seg * batch_size * 300
+                    end_idx = min((seg + 1) * batch_size * 300, output_duration*50)
+                    current_batch_size = batch_size if seg != num_segments-1 or num_batch % batch_size == 0 else num_batch % batch_size
+                    
+                    left, right = stage2_generate_stereo(
+                        model,
+                        prompt_left[:, start_idx:end_idx],
+                        prompt_right[:, start_idx:end_idx],
+                        codectool,
+                        mmtokenizer,
+                        device,
+                        batch_size=current_batch_size
+                    )
+                    
+                    segments_left.append(left)
+                    segments_right.append(right)
             
             # Concatenate segments
             output_left = np.concatenate(segments_left, axis=0)
@@ -599,10 +663,12 @@ def stage2_inference_stereo(model, stage1_output_set, stage2_output_dir, codecto
                     process_and_save_audio(
                         audio, 
                         enhanced_path, 
+                        codectool,
                         apply_enhancements=True,
                         diffusion_postproc_model=diffusion_postproc_model,
                         diffusion_steps=diffusion_steps,
-                        diffusion_sampling_method=diffusion_sampling_method
+                        diffusion_sampling_method=diffusion_sampling_method,
+                        audio_processing_level=audio_processing_level
                     )
                 
                 stage2_result_enhanced.append(enhanced_path)

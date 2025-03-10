@@ -34,7 +34,7 @@ from dsp.reverb import (
 def mix_tracks_basic(vocal, instrumental, vocal_gain=1.0, instrumental_gain=0.8):
     return ((vocal*vocal_gain)+(instrumental*instrumental_gain))/(vocal_gain+instrumental_gain)
 
-def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
+def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100, processing_level="full"):
     """
     Integrated pipeline that:
      1. Normalizes
@@ -54,8 +54,15 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
      15. (Optional) stereo width
      16. (Optional) look-ahead limiting or soft clip
      ...
+     
+    Args:
+        processing_level: Controls the intensity of processing
+            - "minimal": Only essential effects (normalization, phase alignment)
+            - "standard": Core effects but less computationally intensive
+            - "full": All effects at maximum quality
     """
-    # default
+    
+    # default parameters for full processing
     DEFAULT_PARAMS = {
         'vocal_gain': 1.0,
         'instrumental_gain': 0.8,
@@ -124,12 +131,51 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
             'mix': 0.15
         }
     }
+    
+    # Set default parameters if not provided
     if mix_params is None:
-        params = DEFAULT_PARAMS
+        mix_params = DEFAULT_PARAMS.copy()
     else:
-        # merge
-        params = deep_merge_dicts(DEFAULT_PARAMS, mix_params)
-
+        # merge provided params with defaults
+        mix_params = deep_merge_dicts(DEFAULT_PARAMS, mix_params)
+    
+    # Override parameters based on processing level
+    if processing_level == "minimal":
+        # Override parameters to disable most effects
+        minimal_params = {
+            'phase_alignment': {'enabled': True, 'multiband': False},
+            'normalization': {'enabled': True},
+            'multiband_compression': {'enabled': False},
+            'vocal_compression': {'enabled': False},
+            'instrumental_compression': {'enabled': False},
+            'stereo_width': {'enabled': False},
+            'vocal_enhancement': {'enabled': False},
+            'vocal_space_carving': {'enabled': False},
+            'instrumental_saturation': {'enabled': False},
+            'exciter': {'enabled': False},
+            'reverb': {'enabled': False},
+            'sidechain': {'enabled': False}
+        }
+        mix_params = deep_merge_dicts(mix_params, minimal_params)
+    elif processing_level == "standard":
+        # Enable core effects but disable the most CPU-intensive ones
+        standard_params = {
+            'phase_alignment': {'enabled': True, 'multiband': True},
+            'normalization': {'enabled': True},
+            'multiband_compression': {'enabled': True},
+            'vocal_compression': {'enabled': True},
+            'instrumental_compression': {'enabled': False},
+            'stereo_width': {'enabled': True, 'width': 1.1},  # Less aggressive
+            'vocal_enhancement': {'enabled': True, 'level': 0.5},  # Lower level
+            'vocal_space_carving': {'enabled': True, 'level': 0.4},  # Lower level
+            'instrumental_saturation': {'enabled': False},
+            'exciter': {'enabled': False},
+            'reverb': {'enabled': True, 'mix': 0.15},  # Lower reverb level
+            'sidechain': {'enabled': True, 'threshold': -24.0, 'ratio': 1.5}  # Moderate sidechain
+        }
+        mix_params = deep_merge_dicts(mix_params, standard_params)
+    # "full" level uses default parameters as already defined
+    
     try:
         # Quick checks
         if not isinstance(vocal, torch.Tensor) or not isinstance(instrumental, torch.Tensor):
@@ -138,15 +184,15 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
             raise ValueError("NaN in input signals.")
         
         # 1) normalization
-        if params['normalization']['enabled']:
+        if mix_params['normalization']['enabled']:
             try:
-                target_lufs = params['normalization']['target_lufs']
+                target_lufs = mix_params['normalization']['target_lufs']
                 vocal, instrumental = normalize(vocal, instrumental, target_lufs, sr)
             except Exception as e:
                 print(f"Warning: normalization failed: {e}")
         
         # 2) phase alignment
-        pa = params['phase_alignment']
+        pa = mix_params['phase_alignment']
         if pa['enabled']:
             try:
                 if pa['multiband']:
@@ -165,15 +211,15 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
                 print(f"Warning: phase alignment failed: {e}")
         
         # 3) compress individually
-        vc = params['vocal_compression']
+        vc = mix_params['vocal_compression']
         if vc['enabled']:
             vocal = apply_compression(vocal, vc['threshold'], vc['ratio'], sr=sr)
-        ic = params['instrumental_compression']
+        ic = mix_params['instrumental_compression']
         if ic['enabled']:
             instrumental = apply_compression(instrumental, ic['threshold'], ic['ratio'], sr=sr)
         
         # 4) vocal enhancement
-        ve = params['vocal_enhancement']
+        ve = mix_params['vocal_enhancement']
         if ve['enabled']:
             try:
                 vocal = enhance_vocals(vocal, level=ve['level'], sr=sr)
@@ -181,7 +227,7 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
                 print(f"Warning: vocal enhancement failed: {e}")
         
         # 5) carve space for vocals in instrumental
-        vsc = params['vocal_space_carving']
+        vsc = mix_params['vocal_space_carving']
         if vsc['enabled']:
             try:
                 instrumental = carve_space_for_vocals(instrumental, vocal, level=vsc['level'], sr=sr)
@@ -189,7 +235,7 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
                 print(f"Warning: vocal space carving failed: {e}")
         
         # 6) instrumental saturation for warmth
-        is_params = params['instrumental_saturation']
+        is_params = mix_params['instrumental_saturation']
         if is_params['enabled']:
             try:
                 instrumental = apply_saturation(
@@ -201,13 +247,13 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
                 print(f"Warning: instrumental saturation failed: {e}")
         
         # 7) Gains
-        vg = params['vocal_gain']
-        ig = params['instrumental_gain']
+        vg = mix_params['vocal_gain']
+        ig = mix_params['instrumental_gain']
         vocal = vocal*vg
         instrumental = instrumental*ig
         
         # 8) sidechain
-        sc = params['sidechain']
+        sc = mix_params['sidechain']
         if sc['enabled']:
             # sidechain compress instrumental with vocal
             instrumental = apply_compression(instrumental, sc['threshold'], sc['ratio'], sr=sr,
@@ -220,7 +266,7 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
             mixed = mixed*(1.0/max_val)  # quick fix
         
         # 10) multi-band comp on the mix
-        mbc = params['multiband_compression']
+        mbc = mix_params['multiband_compression']
         if mbc['enabled']:
             if len(mbc['bands'])==len(mbc['thresholds'])==len(mbc['ratios']):
                 mixed = apply_compression(
@@ -233,7 +279,7 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
                 print("Warning: multi-band compression param mismatch.")
         
         # 11) exciter for high-end clarity
-        ex = params['exciter']
+        ex = mix_params['exciter']
         if ex['enabled']:
             try:
                 mixed = exciter(mixed, amount=ex['amount'], freq=ex['frequency'], sr=sr)
@@ -241,7 +287,7 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
                 print(f"Warning: exciter failed: {e}")
         
         # 12) multi-band saturation
-        mbs = params['multiband_saturation']
+        mbs = mix_params['multiband_saturation']
         if mbs['enabled']:
             try:
                 if len(mbs['bands'])==len(mbs['amounts']):
@@ -258,7 +304,7 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
                 print(f"Warning: multi-band saturation failed: {e}")
         
         # 13) spectral balancing
-        sb = params['spectral_balance']
+        sb = mix_params['spectral_balance']
         if sb['enabled']:
             try:
                 mixed = spectral_balance(mixed, strength=sb['strength'], sr=sr)
@@ -266,7 +312,7 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
                 print(f"Warning: spectral balancing failed: {e}")
         
         # 14) reverb/ambience
-        rv = params['reverb']
+        rv = mix_params['reverb']
         if rv['enabled']:
             try:
                 mixed = apply_reverb(
@@ -280,7 +326,7 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
             except Exception as e:
                 print(f"Warning: reverb failed: {e}")
         
-        amb = params['ambience']
+        amb = mix_params['ambience']
         if amb['enabled'] and not rv['enabled']:  # only apply if reverb isn't already applied
             try:
                 mixed = add_space(
@@ -293,14 +339,14 @@ def enhanced_audio_mix(vocal, instrumental, mix_params=None, sr=44100):
                 print(f"Warning: ambience failed: {e}")
         
         # 15) stereo width
-        sw = params['stereo_width']
+        sw = mix_params['stereo_width']
         if sw['enabled'] and mixed.dim()>1 and mixed.shape[0]>=2:
             w = max(0.0, min(2.0, sw['width']))
             mixed = enhance_stereo_width(mixed, w)
         
         # 16) final limiting or soft clip
-        la = params['lookahead_limiter']
-        scp = params['soft_clip']
+        la = mix_params['lookahead_limiter']
+        scp = mix_params['soft_clip']
         
         final = mixed
         if la['enabled']:

@@ -6,8 +6,8 @@ import uuid
 import argparse
 import torch
 import torchaudio
-import platform
 from torchaudio.transforms import Resample
+import datetime
 
 from transformers import AutoModelForCausalLM
 from codecmanipulator import CodecManipulator, StereoCodecManipulator
@@ -25,103 +25,14 @@ from generation import (
     stage2_inference, stage2_inference_stereo, stage1_inference_stereo, stage1_inference
 )
 
-from transformers import BitsAndBytesConfig
-
-def is_wsl():
-    """Check if running under Windows Subsystem for Linux"""
-    if os.path.exists('/proc/version'):
-        with open('/proc/version', 'r') as f:
-            if "microsoft" in f.read().lower():
-                return True
-    return False
-
-def is_windows():
-    """Check if running on Windows"""
-    return platform.system().lower() == "windows"
-
-def _check_gpu_capabilities(gpu_idx):
-    """Check capabilities of a specific GPU"""
-    props = torch.cuda.get_device_properties(gpu_idx)
-    name = props.name
-    memory_mb = props.total_memory // (1024**2)  # Convert to MB
-    supports_flash_attn = props.major >= 8
-    supports_bfloat16 = props.major >= 8
-    
-    return {
-        'name': name,
-        'memory_mb': memory_mb,
-        'supports_flash_attn': supports_flash_attn,
-        'supports_bfloat16': supports_bfloat16
-    }
-
-def _get_recommended_settings(capabilities):
-    """Generate recommended settings based on hardware capabilities"""
-    if not capabilities['has_cuda']:
-        return {
-            'device': 'cpu',
-            'quantization': '4bit_nf4',
-            'audio_processing_level': 'minimal',
-            'diffusion_optimization': 'faster',
-            'disable_flash_attention': True
-        }
-    elif not capabilities['supports_flash_attn']:
-        return {
-            'device': 'cuda',
-            'disable_flash_attention': True,
-            'enable_torch_compile': True,
-            'quantization': '8bit' if max(capabilities['gpu_memory']) >= 12000 else '4bit_nf4',
-            'audio_processing_level': 'standard',
-            'diffusion_optimization': 'faster'
-        }
-    elif min(capabilities['gpu_memory']) < 8000:
-        # Low memory GPUs
-        return {
-            'device': 'cuda',
-            'quantization': '4bit_nf4',
-            'audio_processing_level': 'standard',
-            'diffusion_optimization': 'memory_efficient'
-        }
-    else:
-        # High-end GPUs
-        return {
-            'device': 'cuda',
-            'quantization': 'none',
-            'audio_processing_level': 'full',
-            'diffusion_optimization': 'none'
-        }
-
-def detect_hardware_capabilities():
-    """Detect hardware capabilities and recommend settings"""
-    capabilities = {
-        'has_cuda': torch.cuda.is_available(),
-        'gpu_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
-        'gpu_names': [],
-        'gpu_memory': [],
-        'supports_flash_attn': False,
-        'supports_bfloat16': False,
-        'cpu_count': os.cpu_count(),
-        'recommended_settings': {}
-    }
-    
-    # Check GPU capabilities if available
-    if capabilities['has_cuda']:
-        for i in range(capabilities['gpu_count']):
-            gpu_info = _check_gpu_capabilities(i)
-            capabilities['gpu_names'].append(gpu_info['name'])
-            capabilities['gpu_memory'].append(gpu_info['memory_mb'])
-            
-            # If any GPU supports flash attention, mark as supported
-            if gpu_info['supports_flash_attn']:
-                capabilities['supports_flash_attn'] = True
-                
-            # If any GPU supports bfloat16, mark as supported
-            if gpu_info['supports_bfloat16']:
-                capabilities['supports_bfloat16'] = True
-    
-    # Get recommended settings based on detected capabilities
-    capabilities['recommended_settings'] = _get_recommended_settings(capabilities)
-    
-    return capabilities
+from hardware import (
+    apply_safe_mode_settings, 
+    initialize_device, 
+    configure_memory_settings, 
+    prepare_model_dtype, 
+    prepare_quantization_config, 
+    configure_settings_from_hardware
+)
 
 def parse_arguments():
     """Parse command line arguments"""
@@ -245,107 +156,13 @@ def parse_arguments():
     audio_mixing_group.add_argument("--output_path", type=str, default="./mixed_output.wav",
                                  help="Output path for mixed audio")
     
+    # Basic Configuration
+    parser.add_argument("--auto_batch_size", action="store_true",
+                     help="Automatically determine optimal batch size based on available memory")
+    
     # Add any other arguments you need...
     
     return parser.parse_args()
-
-def _configure_settings_from_hardware(args):
-    """Apply hardware-specific configuration settings"""
-    capabilities = detect_hardware_capabilities()
-    print(f"Detected hardware: {len(capabilities['gpu_names'])} GPUs")
-    for i, (name, memory) in enumerate(zip(capabilities['gpu_names'], capabilities['gpu_memory'])):
-        print(f"  GPU {i}: {name} with {memory} MB VRAM")
-    
-    print("\nRecommended settings for your hardware:")
-    for setting, value in capabilities['recommended_settings'].items():
-        print(f"  --{setting}={value}")
-        
-        # Apply the recommended settings to args
-        if hasattr(args, setting):
-            setattr(args, setting, value)
-            print(f"  Applied: {setting}={value}")
-    
-    print("\nContinuing with auto-configured settings...")
-    return args
-
-def _apply_safe_mode_settings(args):
-    """Apply conservative settings for safe mode"""
-    print("Running in safe mode with conservative settings")
-    # Override settings with safe defaults
-    args.max_new_tokens = min(args.max_new_tokens, 500)
-    args.run_n_segments = min(args.run_n_segments, 1)
-    args.stage2_batch_size = 1
-    args.low_memory_mode = True
-    args.force_cpu = True if is_wsl() or is_windows() else args.force_cpu
-    args.quantization = "4bit_nf4" if args.quantization == "none" else args.quantization
-    args.audio_processing_level = "minimal"
-    args.disable_flash_attention = True
-    return args
-
-def _initialize_device(args):
-    """Initialize the appropriate device based on settings"""
-    if args.force_cpu:
-        device = torch.device("cpu")
-        args.device = "cpu"  # Override device setting
-        print("Forcing CPU-only operation for maximum stability")
-    elif args.device == "cuda" and torch.cuda.is_available():
-        device = torch.device(f"cuda:{args.cuda_idx}")
-        print(f"Using device: {device}")
-    else:
-        device = torch.device("cpu")
-        print("Using device: cpu")
-    return device
-
-def _configure_memory_settings(args):
-    """Configure memory settings based on low-memory mode"""
-    if args.low_memory_mode:
-        print("Running in low memory mode - performance may be slower but more stable")
-        # Increase memory garbage collection
-        torch.cuda.empty_cache()
-        
-        # In low memory mode, explicitly set low quantization config
-        if torch.cuda.is_available() and args.device == "cuda":
-            print("Setting up quantization with reduced precision in low memory mode")
-            
-            # Ensure quantization is set in low memory mode
-            if args.quantization == "none":
-                args.quantization = "8bit"
-                print("Enabling 8-bit quantization for low memory mode")
-            
-            # Reduce max_new_tokens in low memory mode
-            if args.max_new_tokens > 1000:
-                print(f"Reducing max_new_tokens from {args.max_new_tokens} to 1000 in low memory mode")
-                args.max_new_tokens = 1000
-
-def _prepare_model_dtype(args):
-    """Determine model data type based on settings"""
-    if args.no_bfloat16:
-        dtype = torch.float16
-        compute_dtype = torch.float16
-        print("Using float16 precision instead of bfloat16 for better compatibility")
-    else:
-        dtype = torch.float16 if args.device == "cuda" else torch.float32
-        compute_dtype = torch.float16 if args.device == "cuda" else torch.float32
-    return dtype, compute_dtype
-
-def _prepare_quantization_config(args, compute_dtype):
-    """Prepare quantization configuration based on settings"""
-    if args.quantization == "none":
-        return None
-    elif args.quantization == "8bit":
-        return BitsAndBytesConfig(load_in_8bit=True)
-    elif args.quantization == "4bit":
-        return BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=compute_dtype
-        )
-    elif args.quantization == "4bit_nf4":
-        return BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=compute_dtype
-        )
 
 def _load_stage1_model(args, dtype, quantization_config, device):
     """Load the Stage 1 model with appropriate settings"""
@@ -467,11 +284,11 @@ def main():
     
     # Auto-configuration based on hardware detection
     if args.auto_config:
-        args = _configure_settings_from_hardware(args)
+        args = configure_settings_from_hardware(args)
     
     # Apply safe mode settings if requested
     if args.safe_mode:
-        args = _apply_safe_mode_settings(args)
+        args = apply_safe_mode_settings(args)
     
     # Special mode: test audio mixing only
     if args.test_audio_mixing:
@@ -487,13 +304,13 @@ def main():
     seed_everything(args.seed)
     
     # Initialize device based on command line parameter
-    device = _initialize_device(args)
+    device = initialize_device(args)
     
     # Configure memory settings based on mode
-    _configure_memory_settings(args)
+    configure_memory_settings(args)
     
     # Choose precision based on parameters and compatibility
-    dtype, compute_dtype = _prepare_model_dtype(args)
+    dtype, compute_dtype = prepare_model_dtype(args)
     
     # Set up output directories
     os.makedirs(args.output_dir, exist_ok=True)
@@ -537,7 +354,7 @@ def main():
     diffusion_postproc_model = None
     
     if args.use_diffusion:
-        diffusion_models = _initialize_diffusion_models(args, device)
+        diffusion_models = initialize_diffusion_models(args, device)
         # Only extract the models we actually use
         diffusion_postproc_model = diffusion_models.get('postproc')
     
@@ -547,7 +364,7 @@ def main():
         stereo_codectool = StereoCodecManipulator("xcodec", 0, 1)
     
     # Prepare quantization config based on args
-    quantization_config = _prepare_quantization_config(args, compute_dtype)
+    quantization_config = prepare_quantization_config(args, compute_dtype)
     
     # Initialize and load Stage 1 model
     stage1_model = _load_stage1_model(args, dtype, quantization_config, device)
@@ -596,33 +413,60 @@ def main():
         # Placeholder for parallel processing implementation
     
     print("Stage 1 inference...")
-    stage1_output_set = []
+    stage1_output_set = None
     
-    if args.use_stereo and args.use_dual_tracks_prompt:
-        # Use stereo generation
-        stage1_output_set = stage1_inference_stereo(
-            model=stage1_model, 
-            prompt_texts=prompt_text, 
-            codectool=codectool, 
-            mmtokenizer=mmtokenizer, 
-            device=device, 
-            args=args  # Pass args object directly instead of individual parameters
-        )
-    else:
-        # Use mono or standard stereo generation
-        stage1_output_set = stage1_inference(
-            model=stage1_model, 
-            prompt_text=prompt_text,  # Changed from prompt_texts to prompt_text
-            codectool=codectool, 
-            mmtokenizer=mmtokenizer, 
-            device=device, 
-            args=args  # Pass args object directly instead of individual parameters
-        )
+    # Resume from checkpoint if specified
+    if args.resume_from_checkpoint:
+        try:
+            checkpoint_data = load_checkpoint(args.resume_from_checkpoint)
+            print(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
+            
+            # Determine if this is a stage1 or stage2 checkpoint
+            if 'stage1' in os.path.basename(args.resume_from_checkpoint):
+                # We can skip stage1 inference and use these tokens
+                stage1_output_set = checkpoint_data['output_paths']
+                print(f"Using Stage 1 outputs from checkpoint: {len(stage1_output_set)} files")
+            else:
+                print("Unknown checkpoint format - will start from the beginning")
+        except Exception as e:
+            print(f"Error resuming from checkpoint: {e}")
+            print("Starting from the beginning")
     
-    # Offload stage1_model to CPU to save GPU memory
-    if not args.disable_offload_model and args.device == "cuda":
-        stage1_model = stage1_model.to("cpu")
-        torch.cuda.empty_cache()
+    # Run Stage 1 if we don't have results from a checkpoint
+    if not stage1_output_set:
+        if args.use_stereo and args.use_dual_tracks_prompt:
+            # Use stereo generation
+            stage1_output_set = stage1_inference_stereo(
+                model=stage1_model, 
+                prompt_texts=prompt_text, 
+                codectool=codectool, 
+                mmtokenizer=mmtokenizer, 
+                device=device, 
+                args=args  # Pass args object directly instead of individual parameters
+            )
+        else:
+            # Use mono or standard stereo generation
+            stage1_output_set = stage1_inference(
+                model=stage1_model, 
+                prompt_text=prompt_text,  # Changed from prompt_texts to prompt_text
+                codectool=codectool, 
+                mmtokenizer=mmtokenizer, 
+                device=device, 
+                args=args  # Pass args object directly instead of individual parameters
+            )
+        
+        # Save a checkpoint after Stage 1 if enabled
+        if args.enable_checkpointing and stage1_output_set:
+            checkpoint_data = {
+                'output_paths': stage1_output_set,
+                'timestamp': datetime.datetime.now().isoformat()
+            }
+            save_checkpoint('stage1', checkpoint_data, args.output_dir, session_id)
+        
+        # Offload stage1_model to CPU to save GPU memory
+        if not args.disable_offload_model and args.device == "cuda":
+            stage1_model = stage1_model.to("cpu")
+            torch.cuda.empty_cache()
     
     print("Setting up Stage 2 model...")
     stage2_model = AutoModelForCausalLM.from_pretrained(
@@ -632,19 +476,34 @@ def main():
     stage2_model = stage2_model.to(device)
     stage2_model.eval()
     
-    print("Stage 2 inference...")
+    # If auto_batch_size is enabled, calculate the optimal batch size
+    if args.auto_batch_size and args.device == "cuda":
+        print("Calculating optimal batch size for Stage 2...")
+        # Create a sample input shape that matches what stage2_model expects
+        sample_shape = (1, 256)  # Adjust based on typical input size
+        try:
+            optimal_batch_size = calculate_optimal_batch_size(stage2_model, device, sample_shape)
+            print(f"Using auto-calculated batch size: {optimal_batch_size}")
+            args.stage2_batch_size = optimal_batch_size
+        except Exception as e:
+            print(f"Error in batch size calculation: {e}")
+            print(f"Using default batch size: {args.stage2_batch_size}")
+    
+    print(f"Stage 2 inference with batch size {args.stage2_batch_size}...")
     
     # Apply PyTorch compilation to Stage 2 model if requested
     stage2_model = _apply_torch_compile(stage2_model, args)
     
+    stage2_result = []
+    
+    # Determine whether to use stereo processing or standard processing
     if args.use_stereo and args.use_dual_tracks_prompt:
-        # Using the stereo codec tool initialized earlier
         if not stereo_codectool:
             stereo_codectool = StereoCodecManipulator("xcodec", 0, 1)
         
         for stage1_output in stage1_output_set:
             # stereo output - match the expected function signature
-            stage2_inference_stereo(
+            result = stage2_inference_stereo(
                 model=stage2_model,
                 stage1_output_set=[stage1_output],  # Wrap in list to match expected signature
                 stage2_output_dir=stage2_output_dir,
@@ -655,11 +514,15 @@ def main():
                 apply_enhancements=(args.audio_processing_level != "minimal"),
                 diffusion_postproc_model=diffusion_postproc_model if args.use_diffusion_postprocessing else None,
                 diffusion_steps=args.diffusion_steps,
-                diffusion_sampling_method=args.diffusion_sampling_method
+                diffusion_sampling_method=args.diffusion_sampling_method,
+                chunk_size=args.chunk_size,
+                audio_processing_level=args.audio_processing_level
             )
+            if result:
+                stage2_result.extend(result)
     else:
-        # Match the expected function signature for stage2_inference
-        stage2_inference(
+        # Standard non-stereo processing
+        result = stage2_inference(
             model=stage2_model,
             stage1_output_set=stage1_output_set,
             stage2_output_dir=stage2_output_dir,
@@ -670,14 +533,27 @@ def main():
             apply_enhancements=(args.audio_processing_level != "minimal"),
             diffusion_postproc_model=diffusion_postproc_model if args.use_diffusion_postprocessing else None,
             diffusion_steps=args.diffusion_steps,
-            diffusion_sampling_method=args.diffusion_sampling_method
+            diffusion_sampling_method=args.diffusion_sampling_method,
+            chunk_size=args.chunk_size,
+            audio_processing_level=args.audio_processing_level
         )
+        if result:
+            stage2_result.extend(result)
     
     print("Generation complete!")
     print(f"Output files saved in: {stage2_output_dir}")
+    
+    # At the end of Stage 2, save a checkpoint if enabled
+    if args.enable_checkpointing:
+        checkpoint_data = {
+            'output_paths': stage2_result if 'stage2_result' in locals() else [],
+            'timestamp': datetime.datetime.now().isoformat()
+        }
+        save_checkpoint('stage2', checkpoint_data, args.output_dir, session_id)
+    
     return 0
 
-def _initialize_diffusion_models(args, device):
+def initialize_diffusion_models(args, device):
     """Initialize diffusion models based on settings"""
     diffusion_models = {}
     
@@ -812,6 +688,107 @@ def test_audio_mixing(vocal_path, instrumental_path, output_path, processing_lev
     torchaudio.save(output_path, mixed, sr_v)
     print(f"Saved mixed output to {output_path}")
     return True
+
+def save_checkpoint(stage, data, output_dir, session_id):
+    """
+    Save checkpoint data for potential resumption
+    
+    Args:
+        stage: Stage of processing (e.g., 'stage1', 'stage2')
+        data: Data to save (tokens, model outputs, etc.)
+        output_dir: Base output directory
+        session_id: Unique identifier for the generation session
+        
+    Returns:
+        Path to the saved checkpoint
+    """
+    checkpoint_dir = os.path.join(output_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    checkpoint_path = os.path.join(checkpoint_dir, f"{session_id}_{stage}.pt")
+    torch.save(data, checkpoint_path)
+    print(f"Saved checkpoint: {checkpoint_path}")
+    
+    return checkpoint_path
+
+def load_checkpoint(checkpoint_path):
+    """
+    Load checkpoint data for resumption
+    
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        
+    Returns:
+        Loaded checkpoint data
+        
+    Raises:
+        FileNotFoundError: If checkpoint file doesn't exist
+        Exception: If checkpoint loading fails
+    """
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    try:
+        data = torch.load(checkpoint_path)
+        print(f"Loaded checkpoint: {checkpoint_path}")
+        return data
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        raise
+
+def calculate_optimal_batch_size(model, device, input_shape=(1, 1000)):
+    """
+    Determine optimal batch size based on available memory
+    
+    Args:
+        model: Model to test
+        device: Device to use for testing
+        input_shape: Input tensor shape for testing
+        
+    Returns:
+        Optimal batch size for the model and device
+    """
+    if device == "cpu" or device.startswith("cpu"):
+        return 1  # Default to minimal batch size on CPU
+    
+    # Start with a small batch size
+    batch_size = 1
+    max_batch_size = 32  # Upper limit to prevent excessive testing
+    
+    # Get initial free memory
+    torch.cuda.empty_cache()
+    initial_free_memory = torch.cuda.mem_get_info(device)[0] if torch.cuda.is_available() else 0
+    
+    # If we can't measure memory, return a safe default
+    if initial_free_memory == 0:
+        return 4
+    
+    # Create an example input
+    try:
+        example_input = torch.zeros((batch_size,) + input_shape[1:], device=device)
+
+        # Do a test forward pass to account for any lazy initialization
+        with torch.no_grad():
+            _ = model(example_input)
+
+        # Get memory usage after first forward pass
+        memory_after_first = initial_free_memory - torch.cuda.mem_get_info(device)[0]
+
+        # Estimate memory per sample
+        memory_per_sample = memory_after_first / batch_size
+
+        # Calculate safe batch size (using 80% of free memory)
+        safe_memory = 0.8 * initial_free_memory
+        estimated_batch_size = int(safe_memory / memory_per_sample)
+
+        # Constrain to reasonable bounds
+        optimal_batch_size = max(1, min(estimated_batch_size, max_batch_size))
+
+        print(f"Calculated optimal batch size: {optimal_batch_size}")
+        return optimal_batch_size
+    except Exception as e:
+        print(f"Error during batch size estimation: {e}")
+        return 4  # Default to 4 on error, which is a safe value for most GPUs
 
 if __name__ == "__main__":
     main() 
