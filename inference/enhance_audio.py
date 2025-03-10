@@ -97,7 +97,7 @@ def main():
             'phase_align': args.phase_align
         }
         
-        print(f"Mixing audio with enhancements:")
+        print("Mixing audio with enhancements:")
         print(f"  - Vocal: {args.vocal}")
         print(f"  - Instrumental: {args.instrumental}")
         print(f"  - Output: {args.output}")
@@ -117,7 +117,7 @@ def main():
         # Enhancement mode - apply processing to a single audio file
         audio, sr = torchaudio.load(args.audio)
         
-        print(f"Enhancing audio:")
+        print("Enhancing audio:")
         print(f"  - Input: {args.audio}")
         print(f"  - Output: {args.output}")
         print(f"  - Target LUFS: {args.target_lufs}")
@@ -143,7 +143,7 @@ def main():
                 audio = apply_compression(audio, threshold=-18.0, ratio=2.0, sr=sr)
         
         # 3. Enhance stereo width if requested
-        if args.stereo_width != 1.0:
+        if abs(args.stereo_width - 1.0) > 1e-6:  # Use small epsilon for float comparison
             audio = enhance_stereo_width(audio, width=args.stereo_width)
         
         # 4. Apply gain staging to reach target LUFS
@@ -167,7 +167,7 @@ def main():
             resampler = torchaudio.transforms.Resample(sr_ref, sr_audio)
             reference = resampler(reference)
         
-        print(f"Aligning audio to reference:")
+        print("Aligning audio to reference:")
         print(f"  - Audio: {args.audio}")
         print(f"  - Reference: {args.reference}")
         print(f"  - Output: {args.output}")
@@ -181,7 +181,7 @@ def main():
         
     elif args.mode == "multiband" and args.audio and args.reference:
         # Multiband alignment mode
-        print(f"Applying multiband processing:")
+        print("Applying multiband processing:")
         print(f"  - Audio: {args.audio}")
         print(f"  - Reference: {args.reference}")
         print(f"  - Output: {args.output}")

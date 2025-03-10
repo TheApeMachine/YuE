@@ -1,7 +1,7 @@
 import os
 import platform
 import torch
-from torch.nn import BitsAndBytesConfig
+from transformers import BitsAndBytesConfig
 
 def is_wsl():
     """Check if running under Windows Subsystem for Linux"""

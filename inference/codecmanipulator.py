@@ -140,11 +140,7 @@ class CodecManipulator(object):
         if n_quantizer!=self.num_codebooks:
             return einops.rearrange(x, '(T K) -> K T', K=n_quantizer)
         return einops.rearrange(x, '(T K) -> K T', K=self.num_codebooks)
-    
-    # def check_codec_type_from_path(self, path):
-    #     if self.codec_type == "hifi16k":
-    #         assert "academicodec_hifi_16k_320d_large_uni" in path
-    
+        
     def get_codec_type_from_range(self, ids):
         ids_range = [ids.min(), ids.max()]
         codec_range = self.mm_v0_2_cfg["codec_range"]
@@ -160,7 +156,6 @@ class CodecManipulator(object):
             data = npy
         else:
             raise ValueError(f"not supported type: {type(npy)}")
-        # data = data.squeeze()
 
         assert len(data.shape)==2,  f'data shape: {data.shape} is not (n_codebook, seq_len)'
         data = self.offset_tok_ids(

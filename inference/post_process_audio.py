@@ -174,7 +174,7 @@ def multi_resolution_band_extraction(audio, band_ranges, sr=44100, crossfade_rat
         # Add crossfade transitions if this isn't the first or last band
         if i > 0:
             # Crossfade with previous band
-            prev_low, prev_high, _ = sorted_bands[i-1]
+            _, prev_high, _ = sorted_bands[i-1]
             overlap_width = (low_freq - prev_high) * crossfade_ratio
             if overlap_width > 0:
                 # Create crossfade region
@@ -185,7 +185,7 @@ def multi_resolution_band_extraction(audio, band_ranges, sr=44100, crossfade_rat
         
         if i < len(sorted_bands) - 1:
             # Crossfade with next band
-            next_low, next_high, _ = sorted_bands[i+1]
+            next_low, _, _ = sorted_bands[i+1]
             overlap_width = (next_low - high_freq) * crossfade_ratio
             if overlap_width > 0:
                 # Create crossfade region
@@ -244,7 +244,7 @@ def replace_low_freq_with_energy_matched_single(a_waveform, b_waveform, cutoff_f
     
     # Calculate the frequency bin corresponding to the cutoff
     freq_bins = torch.fft.rfftfreq(min_length, d=1.0/sr_b)
-    cutoff_bin = torch.argmin(torch.abs(freq_bins - cutoff_freq))
+    cutoff_bin = torch.argmin(torch.abs(freq_bins - cutoff_freq), dim=0)
     
     # Combine: use b's low frequencies and a's high frequencies
     combined_fft = b_fft.clone()

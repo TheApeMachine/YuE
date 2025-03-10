@@ -22,7 +22,7 @@ def get_masks_and_indices(tokens, min_valid, max_valid):
     """
     invalid_mask = (tokens < min_valid) | (tokens > max_valid)
     valid_mask = ~invalid_mask
-    valid_indices = np.where(valid_mask)[0] if tokens.ndim == 1 else None
+    valid_indices = np.nonzero(valid_mask)[0] if tokens.ndim == 1 else None
     return valid_mask, invalid_mask, valid_indices
 
 
@@ -88,7 +88,7 @@ def analyze_token_issues(tokens, min_valid=0, max_valid=1023):
 
 
 def _fix_invalid_region(
-    row, region, valid_indices, fallback_token, min_valid, max_valid
+    row, region, valid_indices, fallback_token
 ):
     """
     Fix a consecutive region of invalid tokens by either position-based or boundary-based approach.
@@ -143,7 +143,7 @@ def _fix_invalid_region(
 
 
 def _fix_invalid_tokens_in_row(
-    row, min_valid, max_valid, valid_tokens, fallback_token, use_knn
+    row, min_valid, max_valid, fallback_token, use_knn
 ):
     """
     Given a single row of tokens, fix all invalid entries using:
@@ -152,8 +152,8 @@ def _fix_invalid_tokens_in_row(
     
     Returns a dict { invalid_index: fixed_value }.
     """
-    valid_mask, invalid_mask, valid_indices = get_masks_and_indices(row, min_valid, max_valid)
-    invalid_indices = np.where(invalid_mask)[0]
+    _, invalid_mask, valid_indices = get_masks_and_indices(row, min_valid, max_valid)
+    invalid_indices = np.nonzero(invalid_mask)[0]
     
     # If no invalid tokens, nothing to fix.
     if len(invalid_indices) == 0:
@@ -184,7 +184,7 @@ def _fix_invalid_tokens_in_row(
                 neighbor_positions = valid_indices[idx_neighbors[i]]
                 neighbor_tokens = row[neighbor_positions]
 
-                # Weighted “vote” on neighbor tokens:
+                # Weighted "vote" on neighbor tokens:
                 token_score = {}
                 for neighbor_tkn, w in zip(neighbor_tokens, weights[i]):
                     token_score[neighbor_tkn] = token_score.get(neighbor_tkn, 0.0) + w
@@ -214,7 +214,7 @@ def _fix_invalid_tokens_in_row(
         # Fix each region
         for reg in regions:
             region_fixes = _fix_invalid_region(
-                row, reg, valid_indices, fallback_token, min_valid, max_valid
+                row, reg, valid_indices, fallback_token
             )
             fixes.update(region_fixes)
 
@@ -316,7 +316,7 @@ def fix_tokens(
 
     # Prepare row data
     row_data = [
-        (i, fixed_output[i], min_valid, max_valid, valid_tokens, fallback_token, use_knn)
+        (i, fixed_output[i], min_valid, max_valid, fallback_token, use_knn)
         for i in range(fixed_output.shape[0])
     ]
 
@@ -329,8 +329,8 @@ def fix_tokens(
                 fixed_output[i, pos] = tok
 
     def _process_row_wrapper(args):
-        i, row, mn, mx, vt, fb, knn_flag = args
-        fixes = _fix_invalid_tokens_in_row(row, mn, mx, vt, fb, knn_flag)
+        i, row, mn, mx, fb, knn_flag = args
+        fixes = _fix_invalid_tokens_in_row(row, mn, mx, fb, knn_flag)
         return i, fixes
 
     try:

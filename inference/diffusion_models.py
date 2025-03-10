@@ -69,18 +69,7 @@ class DiffusionModel(nn.Module):
                 filename="pytorch_model.bin",
                 cache_dir=cache_dir
             )
-            
-            # Download config if available
-            try:
-                config_file = hf_hub_download(
-                    repo_id=self.hf_model_id,
-                    filename="config.json",
-                    cache_dir=cache_dir
-                )
-                # Could parse config here if needed
-            except:
-                pass
-                
+                            
             # Load model
             model_weights = torch.load(model_file, map_location=self.device)
             
@@ -215,12 +204,12 @@ class DiffusionModel(nn.Module):
             
         return noise_pred
             
-    def _ddpm_sample(self, x_T, condition=None, steps=50, guidance_scale=3.0):
+    def _ddpm_sample(self, x_noise, condition=None, steps=50, guidance_scale=3.0):
         """
         DDPM sampling algorithm
         
         Args:
-            x_T: Starting noise
+            x_noise: Starting noise
             condition: Conditioning information
             steps: Number of diffusion steps
             guidance_scale: Scale for classifier-free guidance
@@ -229,7 +218,6 @@ class DiffusionModel(nn.Module):
             Denoised sample
         """
         # Get noise schedule for sampling timesteps
-        betas = self.noise_schedule['betas']
         alphas = self.noise_schedule['alphas']
         alphas_cumprod = self.noise_schedule['alphas_cumprod']
         
@@ -237,7 +225,7 @@ class DiffusionModel(nn.Module):
         timesteps = torch.linspace(0, len(alphas_cumprod)-1, steps=steps).long().to(self.device)
         timesteps = timesteps.flip(0)  # Start from T, go to 0
         
-        x_t = x_T
+        x_t = x_noise
         
         # Sampling loop
         for i, t in enumerate(tqdm(timesteps, desc="DDPM Sampling")):
@@ -250,9 +238,8 @@ class DiffusionModel(nn.Module):
             
             # 2. Get next timestep
             t_next = timesteps[i + 1]
-            alpha_t = alphas[t]
+            # We only need the alpha and beta values that are actually used
             alpha_t_next = alphas[t_next]
-            beta_t = betas[t]
             alpha_cumprod_t = alphas_cumprod[t]
             alpha_cumprod_t_next = alphas_cumprod[t_next]
             
@@ -277,12 +264,12 @@ class DiffusionModel(nn.Module):
                 
         return x_t
             
-    def _ddim_sample(self, x_T, condition=None, steps=50, guidance_scale=3.0):
+    def _ddim_sample(self, x_noise, condition=None, steps=50, guidance_scale=3.0):
         """
         DDIM sampling algorithm (faster than DDPM with similar quality)
         
         Args:
-            x_T: Starting noise
+            x_noise: Starting noise
             condition: Conditioning information
             steps: Number of diffusion steps
             guidance_scale: Scale for classifier-free guidance
@@ -297,7 +284,7 @@ class DiffusionModel(nn.Module):
         timesteps = torch.linspace(0, len(alphas_cumprod)-1, steps=steps).long().to(self.device)
         timesteps = timesteps.flip(0)  # Start from T, go to 0
         
-        x_t = x_T
+        x_t = x_noise
         
         # Sampling loop
         for i, t in enumerate(tqdm(timesteps, desc="DDIM Sampling")):
@@ -320,12 +307,12 @@ class DiffusionModel(nn.Module):
                 
         return x_t
         
-    def _plms_sample(self, x_T, condition=None, steps=50, guidance_scale=3.0):
+    def _plms_sample(self, x_noise, condition=None, steps=50, guidance_scale=3.0):
         """
         PLMS sampling algorithm (Pseudo Linear Multistep - an improved method)
         
         Args:
-            x_T: Starting noise
+            x_noise: Starting noise
             condition: Conditioning information
             steps: Number of diffusion steps
             guidance_scale: Scale for classifier-free guidance
@@ -340,7 +327,7 @@ class DiffusionModel(nn.Module):
         timesteps = torch.linspace(0, len(alphas_cumprod)-1, steps=steps).long().to(self.device)
         timesteps = timesteps.flip(0)  # Start from T, go to 0
         
-        x_t = x_T
+        x_t = x_noise
         noise_preds = []
         
         # Sampling loop
@@ -453,11 +440,10 @@ class HybridArchitectureDiffusion(DiffusionModel):
         if condition is not None:
             c_emb = self.cond_embed(condition)
         
-        # Combine embeddings
-        emb = t_emb + c_emb
+        # Combine time and condition embeddings for use in the model
+        h = x + c_emb.unsqueeze(-1).unsqueeze(-1)  # Add conditioning as a residual connection
         
         # Encoder
-        h = x
         skip_connections = []
         for layer in self.encoder:
             h = layer(h)
@@ -523,7 +509,7 @@ class HybridArchitectureDiffusion(DiffusionModel):
         # Create initial noise (shape depends on audio upsampling ratio)
         # Assuming a standard ratio of 256 audio samples per token
         audio_length = seq_len * 256
-        x_T = torch.randn((batch_size, 2, audio_length), device=self.device)  # Stereo audio
+        x_noise = torch.randn((batch_size, 2, audio_length), device=self.device)  # Stereo audio
         
         # Process structure tokens to get conditioning
         # This could involve additional embedding or processing
@@ -531,7 +517,7 @@ class HybridArchitectureDiffusion(DiffusionModel):
         
         # Run denoising diffusion
         return self.denoise(
-            x_T, 
+            x_noise, 
             condition=condition,
             steps=steps,
             sampling_method=sampling_method,
@@ -734,11 +720,10 @@ class ConditionalDiffusion(DiffusionModel):
         if condition is not None:
             c_emb = self.codec_embed(condition)
         
-        # Combine embeddings 
-        emb = t_emb + c_emb
+        # Combine time and condition embeddings for use in the model
+        h = x + c_emb.unsqueeze(-1).unsqueeze(-1)  # Add conditioning as a residual connection
         
         # Encoder
-        h = x
         skip_connections = []
         for layer in self.encoder:
             h = layer(h)
@@ -792,13 +777,13 @@ class ConditionalDiffusion(DiffusionModel):
         # Get shape information
         batch_size, seq_len = codec_tokens.shape[:2]
         
-        # Create initial noise (assuming a 256 expansion factor)
+        # Create initial noise (shape depends on audio upsampling ratio)
         audio_length = seq_len * 256
-        x_T = torch.randn((batch_size, 2, audio_length), device=self.device)  # Stereo audio
+        x_noise = torch.randn((batch_size, 2, audio_length), device=self.device)  # Stereo audio
         
         # Run denoising diffusion with conditioning
         return self.denoise(
-            x_T, 
+            x_noise, 
             condition=codec_tokens.to(self.device),
             steps=steps,
             sampling_method=sampling_method,

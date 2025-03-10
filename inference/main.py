@@ -21,9 +21,9 @@ from audio_utils import (
 from codec_utils import (
     seed_everything, encode_audio, encode_audio_stereo, split_lyrics
 )
-from generation import (
-    stage2_inference, stage2_inference_stereo, stage1_inference_stereo, stage1_inference
-)
+
+from stage1 import (stage1_inference_stereo, stage1_inference)
+from stage2 import (stage2_inference, stage2_inference_stereo)
 
 from hardware import (
     apply_safe_mode_settings, 
