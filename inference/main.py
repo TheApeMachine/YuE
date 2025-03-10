@@ -31,7 +31,8 @@ from hardware import (
     configure_memory_settings, 
     prepare_model_dtype, 
     prepare_quantization_config, 
-    configure_settings_from_hardware
+    configure_settings_from_hardware,
+    run_system_diagnostics
 )
 
 def parse_arguments():
@@ -118,6 +119,8 @@ def parse_arguments():
                              help="Disable Flash Attention for compatibility with older GPUs")
     hardware_group.add_argument("--enable_torch_compile", action="store_true",
                              help="Enable PyTorch 2.0+ compilation for improved performance on all hardware")
+    hardware_group.add_argument("--disable_torch_compile", action="store_true",
+                             help="Disable PyTorch compilation which can cause issues on older GPUs")
     hardware_group.add_argument("--torch_compile_mode", type=str, choices=["default", "reduce-overhead", "max-autotune"],
                              default="reduce-overhead", help="Compilation mode for PyTorch 2.0+")
     hardware_group.add_argument("--torch_compile_fullgraph", action="store_true", 
@@ -138,6 +141,8 @@ def parse_arguments():
                              help="How to split models across GPUs: by layer, by model type, or hybrid approach")
     hardware_group.add_argument("--enable_parallel_processing", action="store_true",
                              help="Enable parallel processing across multiple GPUs")
+    hardware_group.add_argument("--gradient_checkpointing", action="store_true",
+                             help="Enable gradient checkpointing for more memory efficiency")
     
     # Advanced Options
     hardware_group.add_argument("--chunk_size", type=int, default=None,
@@ -149,16 +154,22 @@ def parse_arguments():
     
     # Audio Mixing Test Arguments
     audio_mixing_group = parser.add_argument_group('Audio Mixing Test')
-    audio_mixing_group.add_argument("--vocal_path", type=str, default="",
-                                 help="Path to vocal audio file for audio mixing tests")
-    audio_mixing_group.add_argument("--instrumental_path", type=str, default="",
-                                 help="Path to instrumental audio file for audio mixing tests")
-    audio_mixing_group.add_argument("--output_path", type=str, default="./mixed_output.wav",
-                                 help="Output path for mixed audio")
+    audio_mixing_group.add_argument("--test_vocal_path", type=str, default='', help='Path to test vocal file for audio mixing.')
+    audio_mixing_group.add_argument("--test_instrumental_path", type=str, default='', help='Path to test instrumental file for audio mixing.')
+    audio_mixing_group.add_argument("--test_output_path", type=str, default='./output/test_mix.wav', help='Path to output file for audio mixing test.')
     
     # Basic Configuration
     parser.add_argument("--auto_batch_size", action="store_true",
                      help="Automatically determine optimal batch size based on available memory")
+    
+    # === Diagnostics and Troubleshooting ===
+    diagnostics_group = parser.add_argument_group('Diagnostics and Troubleshooting')
+    diagnostics_group.add_argument("--run_diagnostics", action="store_true",
+                   help="Run comprehensive system diagnostics to check for potential issues")
+    diagnostics_group.add_argument("--test_device", action="store_true",
+                   help="Test selected device with basic operations before running inference")
+    diagnostics_group.add_argument("--force_overwrite", action="store_true",
+                   help="Force overwrite of existing output files")
     
     # Add any other arguments you need...
     
@@ -262,6 +273,10 @@ def _apply_model_device_mapping(model, transformer_device, model_name="model"):
 
 def _apply_torch_compile(model, args):
     """Apply PyTorch compilation if available"""
+    if getattr(args, 'disable_torch_compile', False):
+        print("PyTorch compilation explicitly disabled")
+        return model
+        
     if args.enable_torch_compile and hasattr(torch, "compile"):
         try:
             print(f"Applying PyTorch compilation with mode: {args.torch_compile_mode}")
@@ -282,6 +297,15 @@ def main():
     # Parse arguments
     args = parse_arguments()
     
+    # Run diagnostics if requested (do this first, before any model loading)
+    if args.run_diagnostics:
+        run_system_diagnostics()
+        
+        # If only diagnostics were requested (without other arguments), exit after diagnostics
+        if not args.genre_txt:
+            print("Diagnostics completed. Exiting as no generation arguments were provided.")
+            return 0
+    
     # Auto-configuration based on hardware detection
     if args.auto_config:
         args = configure_settings_from_hardware(args)
@@ -292,12 +316,12 @@ def main():
     
     # Special mode: test audio mixing only
     if args.test_audio_mixing:
-        if not (args.vocal_path and args.instrumental_path):
-            print("Error: --vocal_path and --instrumental_path are required for audio mixing test")
+        if not (args.test_vocal_path and args.test_instrumental_path):
+            print("Error: --test_vocal_path and --test_instrumental_path are required for audio mixing test")
             return 1
         
-        test_audio_mixing(args.vocal_path, args.instrumental_path, args.output_path, args.audio_processing_level)
-        print(f"Audio mixing test completed. Output saved to {args.output_path}")
+        test_audio_mixing(args.test_vocal_path, args.test_instrumental_path, args.test_output_path, args.audio_processing_level)
+        print(f"Audio mixing test completed. Output saved to {args.test_output_path}")
         return 0
     
     # Set the seed for reproducibility
